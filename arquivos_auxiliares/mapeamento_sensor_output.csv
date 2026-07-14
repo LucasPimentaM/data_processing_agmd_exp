@@ -1,0 +1,7 @@
+instrumento,referencia_output_agilent,descricao,referencia_tratamento_dados,titulo_tratamento_dados
+T-7501.25,101,parte quente entrada parte superior,T1,Hot side Intet temperature
+T-7504.25,102,parte quente saida parte inferior,T2,Hot side outlet temperature
+T-7503.25,103,parte fria saida parte superior,T3,Cold side outlet temperature
+T-7502.25,104,parte fria entrada parte inferior,T4,Cold side inlet temperature
+143025,121,dif presão lado frio,P1,Pressure difference cold side
+143026,122,dif presão lado quente,P2,Pressure difference hot side
