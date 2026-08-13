@@ -43,7 +43,6 @@ class WorkspaceData:
     agilent: pd.DataFrame
     balance: pd.DataFrame
     sensor_uncertainties: Dict[str, float]
-    balance_uncertainty: float
     experiment_metadata: pd.DataFrame
     sensor_titles: Dict[str, str]
 
@@ -102,13 +101,12 @@ def _load_experiment_metadata(experiment_map: pd.DataFrame) -> pd.DataFrame:
 
 def _load_sensor_reference(
     sensor_map: pd.DataFrame, uncertainty_map: pd.DataFrame,
-) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, float], float, PressureCalibration]:
+) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, float], PressureCalibration]:
     sensor_code_to_name: Dict[str, str] = {}
     sensor_titles: Dict[str, str] = {}
     sensor_uncertainties: Dict[str, float] = {}
 
     uncertainty_lookup = dict(zip(uncertainty_map["instrumento"].astype(str), uncertainty_map["incerteza"]))
-    balance_uncertainty = float(uncertainty_lookup.get("balanca", 0.0))
     pressure_calibration = PressureCalibration(coefficient_a_ma={}, coefficient_b_kpa={}, adjustment_uncertainty_kpa={})
 
     if PRESSURE_CALIBRATION_FILE.exists():
@@ -135,7 +133,7 @@ def _load_sensor_reference(
             else:
                 sensor_uncertainties[canonical] = base_uncertainty
 
-    return sensor_code_to_name, sensor_titles, sensor_uncertainties, balance_uncertainty, pressure_calibration
+    return sensor_code_to_name, sensor_titles, sensor_uncertainties, pressure_calibration
 
 def _load_agilent_file(path: Path, experiment_id: str, replicate_group: str, sensor_code_to_name: Dict[str, str], pressure_calibration: PressureCalibration) -> pd.DataFrame:
     df = pd.read_csv(path, encoding="utf-16", skiprows=14)
@@ -173,7 +171,7 @@ def _load_balance_file(path: Path, experiment_id: str, replicate_group: str) -> 
 @st.cache_data(show_spinner=False)
 def load_workspace_data() -> WorkspaceData:
     sensor_map, experiment_map, uncertainty_map, _ = _read_reference_tables()
-    sensor_code_to_name, sensor_titles, sensor_uncertainties, balance_uncertainty, pressure_calibration = _load_sensor_reference(sensor_map, uncertainty_map)
+    sensor_code_to_name, sensor_titles, sensor_uncertainties, pressure_calibration = _load_sensor_reference(sensor_map, uncertainty_map)
     experiment_metadata = _load_experiment_metadata(experiment_map)
 
     agilent_frames, balance_frames = [], []
@@ -200,11 +198,11 @@ def load_workspace_data() -> WorkspaceData:
     if not agilent_df.empty: agilent_df = agilent_df.merge(metadata_for_merge, left_on="experiment_id", right_on="experimento", how="left")
     if not balance_df.empty: balance_df = balance_df.merge(metadata_for_merge, left_on="experiment_id", right_on="experimento", how="left")
 
-    return WorkspaceData(agilent_df, balance_df, sensor_uncertainties, balance_uncertainty, experiment_metadata, sensor_titles)
+    return WorkspaceData(agilent_df, balance_df, sensor_uncertainties, experiment_metadata, sensor_titles)
 
 
 # ==========================================
-# FUNÇÕES ESTATÍSTICAS E MATEMÁTICAS 
+# FUNÇÕES ESTATÍSTICAS E MATEMÁTICAS (METROLOGIA GUM)
 # ==========================================
 def find_longest_true_block(mask: pd.Series) -> Optional[Tuple[int, int]]:
     values = mask.fillna(False).to_numpy()
@@ -248,13 +246,13 @@ def filter_by_domains(df: pd.DataFrame, domains: List[DomainInterval], experimen
             rows.append(group[(group[time_col] >= d.start_time) & (group[time_col] <= d.end_time)])
     return pd.concat(rows, ignore_index=True) if rows else df.iloc[0:0].copy()
 
-def t_student_uncertainty(values: pd.Series, confidence_level: float = 0.95) -> float:
+def standard_uncertainty_type_a(values: pd.Series) -> Tuple[float, int]:
+    """Retorna Incerteza Padrão Tipo A (1 sigma) e graus de liberdade."""
     clean = values.dropna().to_numpy()
     n = len(clean)
-    if n <= 1: return 0.0
+    if n <= 1: return 0.0, 0
     std = float(np.std(clean, ddof=1))
-    t_value = float(t.ppf((1 + confidence_level) / 2, df=n - 1))
-    return t_value * std / np.sqrt(n)
+    return std / np.sqrt(n), n - 1
 
 def fit_time_trend(df: pd.DataFrame, time_col: str, value_col: str) -> Dict[str, float]:
     clean = df[[time_col, value_col]].dropna().sort_values(time_col)
@@ -268,17 +266,25 @@ def summarize_sensors(df: pd.DataFrame, experiment_col: str, group_col: str, sen
     rows = []
     for (exp_id, grp_id), group in df.groupby([experiment_col, group_col]):
         base = {"experiment_id": exp_id, "replicate_group": grp_id}
-        for sensor, u_inst in sensor_uncertainties.items():
+        for sensor, u_b in sensor_uncertainties.items():
             if sensor in group.columns:
-                u_t = t_student_uncertainty(group[sensor], confidence_level)
+                u_a, dof_a = standard_uncertainty_type_a(group[sensor])
                 base[f"{sensor}_mean"] = float(group[sensor].mean())
-                base[f"{sensor}_u_inst"] = u_inst
-                base[f"{sensor}_u_t"] = u_t
-                base[f"{sensor}_u_comb"] = float(np.sqrt(u_inst**2 + u_t**2))
+                base[f"{sensor}_u_type_a"] = u_a
+                base[f"{sensor}_u_type_b"] = u_b
+                
+                u_c = float(np.sqrt(u_a**2 + u_b**2))
+                base[f"{sensor}_u_comb_std"] = u_c
+                
+                dof_eff = (u_c**4) / ((u_a**4) / dof_a) if u_a > 0 else np.inf
+                k = float(t.ppf((1 + confidence_level) / 2, df=dof_eff)) if dof_eff < np.inf and dof_eff >= 1 else 2.00
+                base[f"{sensor}_u_expanded"] = k * u_c
+                
         rows.append(base)
     return pd.DataFrame(rows)
 
-def summarize_balance(df: pd.DataFrame, experiment_col: str, group_col: str, confidence_level: float = 0.95) -> pd.DataFrame:
+def summarize_balance(df: pd.DataFrame, experiment_col: str, group_col: str) -> pd.DataFrame:
+    """Extrai estritamente a taxa e a Incerteza Padrão (Erro Padrão) proveniente do ajuste linear."""
     rows = []
     for (exp_id, grp_id), group in df.groupby([experiment_col, group_col]):
         trend = fit_time_trend(group, "timestamp", "Leitura")
@@ -286,18 +292,16 @@ def summarize_balance(df: pd.DataFrame, experiment_col: str, group_col: str, con
         stderr = trend["stderr"] if not np.isnan(trend["stderr"]) else 0.0 
         n = len(group.dropna(subset=["Leitura"]))
         
-        # Incerteza usando t-Student na regressão linear da taxa
-        if n > 2 and stderr > 0:
-            t_val = float(t.ppf((1 + confidence_level) / 2, df=n - 2))
-            u_t = t_val * stderr
-        else:
-            u_t = 0.0
+        # Incerteza Padrão (Tipo A) vinda puramente da regressão linear
+        u_a_reg = stderr if n > 2 else 0.0
+        dof_reg = n - 2 if n > 2 else 0
             
         rows.append({
             "experiment_id": exp_id,
             "replicate_group": grp_id,
             "permeate_rate": slope,
-            "permeate_rate_u": u_t,
+            "permeate_rate_u_a_reg": u_a_reg,
+            "permeate_rate_dof_reg": dof_reg,
             "r2": trend["r2"],
             "n_points": n,
         })
@@ -332,31 +336,65 @@ def grubbs_iterative(grouped: pd.DataFrame, group_col: str, value_col: str, alph
     rejected_df = pd.DataFrame(rejected_rows) if rejected_rows else grouped.iloc[0:0]
     return accepted_df, rejected_df
 
-def combine_replicate_uncertainty(df: pd.DataFrame, group_col: str, value_col: str, value_uncertainty_col: str, confidence_level: float = 0.95) -> pd.DataFrame:
+def combine_replicate_uncertainty(df: pd.DataFrame, group_col: str, value_col: str, inst_u_col: str, inst_dof_col: str, confidence_level: float = 0.95) -> pd.DataFrame:
+    """Combina as incertezas de regressão (internas) com a variabilidade das réplicas (externas)."""
     rows = []
     for group_name, group in df.groupby(group_col):
         n = len(group)
         group_mean = float(group[value_col].mean())
-        u_exp = float(np.sqrt(np.sum(group[value_uncertainty_col].to_numpy() ** 2)) / n)
         
-        # Incerteza combinada com t-Student a 95%
-        if n > 1:
-            std_rep = float(np.std(group[value_col].to_numpy(), ddof=1))
-            t_value = float(t.ppf((1 + confidence_level) / 2, df=n - 1))
-            u_rep = t_value * std_rep / np.sqrt(n)
+        # Propagação da Incerteza da Regressão Linear para a média das réplicas
+        u_inst_arr = group[inst_u_col].to_numpy()
+        dof_inst_arr = group[inst_dof_col].to_numpy()
+        
+        # Incerteza da média devida às regressões: 1/n * sqrt(sum(u_i^2))
+        u_reg_mean = float(np.sqrt(np.sum(u_inst_arr**2)) / n)
+        
+        # Graus de liberdade efetivos da incerteza combinada das regressões
+        if u_reg_mean > 0:
+            num = (np.sum(u_inst_arr**2))**2
+            den = np.sum((u_inst_arr**4) / np.where(dof_inst_arr > 0, dof_inst_arr, np.inf))
+            dof_reg_mean = float(num / den) if den > 0 else np.inf
         else:
-            u_rep = 0.0
+            dof_reg_mean = np.inf
+        
+        if n > 1:
+            # Variabilidade Tipo A Estatística da Média das réplicas (Variabilidade externa)
+            std_rep = float(np.std(group[value_col].to_numpy(), ddof=1))
+            u_a_rep = std_rep / np.sqrt(n)
+            dof_a_rep = n - 1
+        else:
+            u_a_rep = 0.0
+            dof_a_rep = 0
+            
+        # Combinação estritamente de Incertezas Padrão
+        u_c = float(np.sqrt(u_a_rep**2 + u_reg_mean**2))
+        
+        # Expansão Final (Welch-Satterthwaite)
+        term_a = (u_a_rep**4) / dof_a_rep if dof_a_rep > 0 else 0
+        term_reg = (u_reg_mean**4) / dof_reg_mean if (dof_reg_mean < np.inf and dof_reg_mean > 0) else 0
+        
+        if u_c > 0 and (term_a + term_reg) > 0:
+            dof_eff = (u_c**4) / (term_a + term_reg)
+        else:
+            dof_eff = np.inf
+            
+        k = float(t.ppf((1 + confidence_level) / 2, df=dof_eff)) if dof_eff < np.inf and dof_eff >= 1 else 2.00
+        u_expanded = k * u_c
             
         rows.append({
             "replicate_group": group_name, "n_instances": n, "permeate_rate_mean": group_mean,
-            "u_from_experiments": u_exp, "u_from_replicates_t": u_rep, 
-            "u_group_combined": float(np.sqrt(u_exp**2 + u_rep**2)),
+            "u_type_a_rep": u_a_rep, "dof_a_rep": dof_a_rep, 
+            "u_reg_mean": u_reg_mean, "dof_reg_mean": dof_reg_mean,
+            "u_combined_standard": u_c, "dof_eff": dof_eff, "k_factor": k,
+            "u_expanded": u_expanded
         })
     return pd.DataFrame(rows)
 
-def chi_square_propagated_uncertainty(accepted_df: pd.DataFrame, group_summary: pd.DataFrame, group_col: str, permeate_col: str, permeate_u_col: str, confidence_level: float = 0.95) -> pd.DataFrame:
+def chi_square_propagated_uncertainty(accepted_df: pd.DataFrame, group_summary: pd.DataFrame, group_col: str, permeate_col: str, inst_u_col: str, inst_dof_col: str, confidence_level: float = 0.95) -> pd.DataFrame:
+    """Usa a variância agrupada (pooled variance) + Erro da Regressão para experimentos n=1."""
     replicated_groups = group_summary[group_summary["n_instances"] > 1]
-    if replicated_groups.empty: return pd.DataFrame(columns=[group_col, "u_chi_square_proxy", "u_single_final"])
+    if replicated_groups.empty: return pd.DataFrame(columns=[group_col, "u_proxy_type_a", "u_single_expanded"])
 
     per_group_var = accepted_df.groupby(group_col)[permeate_col].var(ddof=1).dropna()
     counts = accepted_df.groupby(group_col)[permeate_col].count()
@@ -364,22 +402,96 @@ def chi_square_propagated_uncertainty(accepted_df: pd.DataFrame, group_summary: 
     rep_counts = counts[counts.index.isin(replicated_groups["replicate_group"])]
     dof_total = int(np.sum(rep_counts - 1))
     
-    if dof_total <= 0: return pd.DataFrame(columns=[group_col, "u_chi_square_proxy", "u_single_final"])
+    if dof_total <= 0: return pd.DataFrame(columns=[group_col, "u_proxy_type_a", "u_single_expanded"])
 
-    # Propagação rigorosa por Qui-Quadrado para limite superior com 95%
+    # Raiz da variância agrupada substituindo o limite superior do Qui-Quadrado (Variabilidade base)
     pooled_var = float(np.sum((rep_counts - 1) * rep_vars) / dof_total)
-    chi2_low = float(chi2.ppf((1 - confidence_level) / 2, dof_total))
-    sigma_upper = float(np.sqrt((dof_total * pooled_var) / chi2_low))
+    u_proxy_type_a = float(np.sqrt(pooled_var))
 
     singles = group_summary[group_summary["n_instances"] == 1].copy()
-    if singles.empty: return pd.DataFrame(columns=[group_col, "u_chi_square_proxy", "u_single_final"])
+    if singles.empty: return pd.DataFrame(columns=[group_col, "u_proxy_type_a", "u_single_expanded"])
 
     singles[group_col] = singles["replicate_group"]
-    single_u = accepted_df[[group_col, permeate_u_col]].drop_duplicates(subset=[group_col]).rename(columns={permeate_u_col: "u_experiment_single"})
-    singles = singles.merge(single_u, on=group_col, how="left")
-    singles["u_chi_square_proxy"] = sigma_upper
-    singles["u_single_final"] = np.sqrt(singles["u_experiment_single"] ** 2 + sigma_upper**2)
-    return singles[[group_col, "u_chi_square_proxy", "u_single_final"]]
+    single_inst = accepted_df[[group_col, inst_u_col, inst_dof_col]].drop_duplicates(subset=[group_col])
+    singles = singles.merge(single_inst, on=group_col, how="left")
+    
+    rows = []
+    for _, row in singles.iterrows():
+        u_reg = float(row[inst_u_col])
+        dof_reg = float(row[inst_dof_col])
+        
+        # Combina a variância base com o erro da regressão específica do ensaio n=1
+        u_c = float(np.sqrt(u_proxy_type_a**2 + u_reg**2))
+        
+        # Welch-Satterthwaite para n=1
+        term_proxy = (u_proxy_type_a**4) / dof_total if dof_total > 0 else 0
+        term_reg = (u_reg**4) / dof_reg if dof_reg > 0 else 0
+        
+        if u_c > 0 and (term_proxy + term_reg) > 0:
+            dof_eff = (u_c**4) / (term_proxy + term_reg)
+        else:
+            dof_eff = np.inf
+            
+        k = float(t.ppf((1 + confidence_level) / 2, df=dof_eff)) if dof_eff < np.inf and dof_eff >= 1 else 2.00
+        u_expanded = k * u_c
+        
+        rows.append({
+            group_col: row[group_col],
+            "u_proxy_type_a": u_proxy_type_a,
+            "u_reg_single": u_reg,
+            "dof_proxy": dof_total,
+            "u_single_combined_standard": u_c,
+            "dof_eff": dof_eff,
+            "k_factor": k,
+            "u_single_expanded": u_expanded
+        })
+        
+    return pd.DataFrame(rows)
+
+def aggregate_sensors(accepted_df: pd.DataFrame, sensor_columns: List[str], confidence_level: float = 0.95) -> pd.DataFrame:
+    """Agrega e propaga a incerteza para os sensores de Temperatura e Pressão."""
+    rows = []
+    for group_name, group in accepted_df.groupby("replicate_group"):
+        row_data = {"replicate_group": group_name}
+        for sensor in sensor_columns:
+            mean_col = f"{sensor}_mean"
+            if mean_col not in group.columns: 
+                continue
+            
+            sensor_data = group.dropna(subset=[mean_col])
+            n = len(sensor_data)
+            
+            if n == 0:
+                row_data[f"{sensor}_mean"] = np.nan
+                row_data[f"{sensor}_u_expanded"] = np.nan
+                continue
+                
+            if n > 1:
+                # Tipo A: Variabilidade da média das réplicas
+                u_a_rep = float(np.std(sensor_data[mean_col].to_numpy(), ddof=1) / np.sqrt(n))
+                dof_a = n - 1
+                
+                # Tipo B: Erro instrumental (constante para o mesmo sensor/instrumento)
+                u_b = float(sensor_data[f"{sensor}_u_type_b"].iloc[0])
+                
+                # Incerteza Combinada
+                u_c = float(np.sqrt(u_a_rep**2 + u_b**2))
+                
+                # Graus de liberdade efetivos e fator k
+                dof_eff = (u_c**4) / ((u_a_rep**4) / dof_a) if u_a_rep > 0 else np.inf
+                k = float(t.ppf((1 + confidence_level) / 2, df=dof_eff)) if dof_eff < np.inf and dof_eff >= 1 else 2.00
+                
+                mean_val = float(sensor_data[mean_col].mean())
+                u_exp = k * u_c
+            else:
+                # n=1: Utiliza a propagação da série temporal já calculada em summarize_sensors
+                mean_val = float(sensor_data[mean_col].iloc[0])
+                u_exp = float(sensor_data[f"{sensor}_u_expanded"].iloc[0])
+                
+            row_data[f"{sensor}_mean"] = mean_val
+            row_data[f"{sensor}_u_expanded"] = u_exp
+        rows.append(row_data)
+    return pd.DataFrame(rows)
 
 def build_experiment_registry(experiment_metadata: pd.DataFrame) -> pd.DataFrame:
     registry = experiment_metadata.copy()
@@ -407,25 +519,36 @@ def build_grouping_tables(registry: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Data
         singles[["group_display_name", "experimento", "flow_setting", "hot_side_inlet_setting"]].rename(columns={"experimento": "experiment_id"}).reset_index(drop=True),
     )
 
-def build_final_report(group_summary: pd.DataFrame, chi_single: pd.DataFrame, registry: pd.DataFrame) -> pd.DataFrame:
+def build_final_report(group_summary: pd.DataFrame, chi_single: pd.DataFrame, sensors_summary: pd.DataFrame, registry: pd.DataFrame) -> pd.DataFrame:
     group_metadata = registry.drop_duplicates(subset=["replicate_group"])[
         ["replicate_group", "group_display_name", "experiments_label", "flow_setting", "hot_side_inlet_setting", "flow_ml_min", "hot_temp_c"]
     ].copy()
     
     report = group_summary.merge(group_metadata, on="replicate_group", how="left")
-    report = report.merge(chi_single[["replicate_group", "u_single_final", "u_chi_square_proxy"]], on="replicate_group", how="left")
+    report = report.merge(chi_single[["replicate_group", "u_single_combined_standard", "u_single_expanded", "u_proxy_type_a", "u_reg_single"]], on="replicate_group", how="left")
+    
+    # Faz a união com os dados dos sensores processados
+    if not sensors_summary.empty:
+        report = report.merge(sensors_summary, on="replicate_group", how="left")
     
     report["report_type"] = np.where(report["n_instances"] > 1, "grupo com réplicas", "experimento único")
-    report["reported_uncertainty"] = np.where(report["n_instances"] > 1, report["u_group_combined"], report["u_single_final"])
+    
+    # A incerteza final reportada assume a Expansão de Confiança baseada no k final
+    report["reported_uncertainty"] = np.where(report["n_instances"] > 1, report["u_expanded"], report["u_single_expanded"])
     report["report_label"] = report["group_display_name"]
     
     keep_columns = [
         "replicate_group", "report_label", "report_type", "experiments_label",
         "flow_setting", "hot_side_inlet_setting", "flow_ml_min", "hot_temp_c",
         "permeate_rate_mean", "reported_uncertainty", "n_instances",
-        "u_from_experiments", "u_from_replicates_t", "u_chi_square_proxy", "u_single_final", "u_group_combined"
+        "u_type_a_rep", "u_proxy_type_a", "u_reg_mean", "u_reg_single", "u_combined_standard", "dof_eff", "k_factor"
     ]
     
+    # Adiciona as colunas dos sensores dinamicamente para exibição final
+    for col in sensors_summary.columns:
+        if col != "replicate_group" and col not in keep_columns:
+            keep_columns.append(col)
+            
     for col in keep_columns:
         if col not in report.columns:
             report[col] = np.nan
@@ -540,14 +663,19 @@ balance_domain_df = filter_by_domains(balance_df, domains, "experiment_id", "tim
 # Cálculo de Taxa e Resumo
 sensor_columns = [col for col in ["T1", "T2", "T3", "T4", "P1", "P2"] if col in agilent_domain_df.columns]
 instance_summary = summarize_sensors(agilent_domain_df, "experiment_id", "replicate_group", {col: workspace.sensor_uncertainties.get(col, 0.0) for col in sensor_columns}, float(confidence_level))
-balance_summary = summarize_balance(balance_domain_df, "experiment_id", "replicate_group", float(confidence_level))
+
+# Note que a incerteza da balança da tabela não é mais repassada
+balance_summary = summarize_balance(balance_domain_df, "experiment_id", "replicate_group")
 instance_summary = instance_summary.merge(balance_summary, on=["experiment_id", "replicate_group"], how="left")
 
 # Teste Grubbs Exclusivo para Taxa de Permeado
 accepted_instances, rejected_instances = grubbs_iterative(instance_summary, "replicate_group", "permeate_rate", float(grubbs_alpha))
-group_summary = combine_replicate_uncertainty(accepted_instances, "replicate_group", "permeate_rate", "permeate_rate_u", float(confidence_level))
-chi_single = chi_square_propagated_uncertainty(accepted_instances, group_summary, "replicate_group", "permeate_rate", "permeate_rate_u", float(confidence_level))
-final_report = build_final_report(group_summary, chi_single, experiment_registry)
+group_summary = combine_replicate_uncertainty(accepted_instances, "replicate_group", "permeate_rate", "permeate_rate_u_a_reg", "permeate_rate_dof_reg", float(confidence_level))
+chi_single = chi_square_propagated_uncertainty(accepted_instances, group_summary, "replicate_group", "permeate_rate", "permeate_rate_u_a_reg", "permeate_rate_dof_reg", float(confidence_level))
+
+# Consolidação dos Sensores para a tabela final
+sensors_summary = aggregate_sensors(accepted_instances, sensor_columns, float(confidence_level))
+final_report = build_final_report(group_summary, chi_single, sensors_summary, experiment_registry)
 
 # Visualizações
 if view_mode == "Visão Geral":
@@ -555,9 +683,8 @@ if view_mode == "Visão Geral":
     
     with tab1:
         st.subheader("Gráficos de Linha: Comportamento do AGMD")
-        st.caption(f"Barras de incerteza exibem o intervalo de confiança de **{confidence_level*100:.0f}%** baseado em t-Student/Qui-Quadrado.")
+        st.caption(f"Barras de incerteza exibem a Incerteza Expandida de **{confidence_level*100:.0f}%** baseada em Welch-Satterthwaite.")
         
-        # Gerar os dois gráficos de linha 2D estrategicamente cruzados
         fig_flow_2d, fig_temp_2d = plot_2d_faceted_lines(final_report)
         
         col_graf_1, col_graf_2 = st.columns(2)
@@ -565,7 +692,7 @@ if view_mode == "Visão Geral":
         with col_graf_2: st.plotly_chart(fig_temp_2d, use_container_width=True)
         
         st.divider()
-        st.subheader("Tabela Consolidada (Taxa de Permeado)")
+        st.subheader("Tabela Consolidada (Taxa de Permeado, Temperaturas e Pressões)")
         st.dataframe(final_report, use_container_width=True, hide_index=True)
 
     with tab2:
@@ -582,9 +709,9 @@ if view_mode == "Visão Geral":
         st.subheader("Domínios de Regime Permanente")
         st.dataframe(pd.DataFrame([d.__dict__ for d in domains]), use_container_width=True, hide_index=True)
 
-        st.subheader("Propagação das Incertezas")
+        st.subheader("Propagação das Incertezas (GUM)")
         with st.expander("Incerteza Combinada (Grupos de Réplicas)"): st.dataframe(group_summary, use_container_width=True, hide_index=True)
-        with st.expander("Qui-Quadrado (Experimentos Únicos)"): st.dataframe(chi_single, use_container_width=True, hide_index=True)
+        with st.expander("Incerteza Testes Únicos (Pooled Variance + Erro Regressão)"): st.dataframe(chi_single, use_container_width=True, hide_index=True)
 
     with tab3:
         st.subheader("Tabelas Estruturais")
