@@ -9,7 +9,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from scipy.stats import chi2, linregress, t
+from scipy.stats import chi2, linregress, t, shapiro, levene
 
 # ==========================================
 # CONFIGURAÇÕES DE DIRETÓRIO E ARQUIVOS
@@ -48,9 +48,12 @@ class WorkspaceData:
 
 @dataclass
 class PressureCalibration:
-    coefficient_a_ma: Dict[str, float]
-    coefficient_b_kpa: Dict[str, float]
-    adjustment_uncertainty_kpa: Dict[str, float]
+    coefficient_a: Dict[str, float]
+    coefficient_b: Dict[str, float]
+    u_I: Dict[str, float]
+    u_A: Dict[str, float]
+    u_B: Dict[str, float]
+    cov_AB: Dict[str, float]
 
 # ==========================================
 # FUNÇÕES DE LEITURA E LIMPEZA
@@ -102,35 +105,45 @@ def _load_experiment_metadata(experiment_map: pd.DataFrame) -> pd.DataFrame:
 def _load_sensor_reference(
     sensor_map: pd.DataFrame, uncertainty_map: pd.DataFrame,
 ) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, float], PressureCalibration]:
+    
     sensor_code_to_name: Dict[str, str] = {}
     sensor_titles: Dict[str, str] = {}
     sensor_uncertainties: Dict[str, float] = {}
 
     uncertainty_lookup = dict(zip(uncertainty_map["instrumento"].astype(str), uncertainty_map["incerteza"]))
-    pressure_calibration = PressureCalibration(coefficient_a_ma={}, coefficient_b_kpa={}, adjustment_uncertainty_kpa={})
+    
+    # Inicializa com as novas variáveis estatísticas
+    pressure_calibration = PressureCalibration(
+        coefficient_a={}, coefficient_b={}, u_I={}, u_A={}, u_B={}, cov_AB={}
+    )
 
     if PRESSURE_CALIBRATION_FILE.exists():
         pressure_df = pd.read_csv(PRESSURE_CALIBRATION_FILE)
         for _, row in pressure_df.iterrows():
-            inst = str(row["instrumento"])
-            pressure_calibration.coefficient_a_ma[inst] = float(row["A (mA)"])
-            pressure_calibration.coefficient_b_kpa[inst] = float(row["B"])
-            pressure_calibration.adjustment_uncertainty_kpa[inst] = float(row["incerteza_ajuste (AX+B=Y em KPa)"])
+            inst = str(row["instrumento"]).split('.')[0].strip()
+            
+            pressure_calibration.coefficient_a[inst] = float(row["A"])
+            pressure_calibration.coefficient_b[inst] = float(row["B"])
+            pressure_calibration.u_I[inst] = float(row["u_I_mA"])
+            pressure_calibration.u_A[inst] = float(row["u_A"])
+            pressure_calibration.u_B[inst] = float(row["u_B"])
+            pressure_calibration.cov_AB[inst] = float(row["cov_AB"])
 
     for _, row in sensor_map.iterrows():
         code = str(row["referencia_output_agilent"])
         canonical = str(row["referencia_tratamento_dados"])
         title = str(row["titulo_tratamento_dados"])
         instrument = str(row["instrumento"])
+        
         sensor_code_to_name[code] = canonical
         sensor_titles[canonical] = title
+        
         if instrument in uncertainty_lookup:
-            base_uncertainty = float(uncertainty_lookup[instrument])
-            if canonical.startswith("P") and instrument in pressure_calibration.coefficient_a_ma:
-                coeff_a = pressure_calibration.coefficient_a_ma[instrument]
-                adjustment_uncertainty = pressure_calibration.adjustment_uncertainty_kpa.get(instrument, 0.0)
-                sensor_uncertainties[canonical] = float(np.sqrt((coeff_a * base_uncertainty) ** 2 + adjustment_uncertainty**2) * 1000.0)
-            else:
+            # Adequação INMETRO: Divide por 2 para obter a Incerteza Padrão (Tipo B)
+            base_uncertainty = float(uncertainty_lookup[instrument]) / 2.0
+            
+            # Como a pressão agora é dinâmica, guardamos apenas as temperaturas no dicionário
+            if not canonical.startswith("P"):
                 sensor_uncertainties[canonical] = base_uncertainty
 
     return sensor_code_to_name, sensor_titles, sensor_uncertainties, pressure_calibration
@@ -144,14 +157,44 @@ def _load_agilent_file(path: Path, experiment_id: str, replicate_group: str, sen
     for column in measurement_columns.values():
         df[column] = pd.to_numeric(df[column], errors="coerce")
 
+    # ==========================================
+    # TRATAMENTO DE PRESSÃO E INCERTEZA (GUM)
+    # ==========================================
     for column in [c for c in measurement_columns.values() if c.startswith("P")]:
         instrument = "143025" if column == "P1" else "143026" if column == "P2" else None
-        if instrument and instrument in pressure_calibration.coefficient_a_ma:
-            coeff_a = pressure_calibration.coefficient_a_ma[instrument]
-            coeff_b = pressure_calibration.coefficient_b_kpa[instrument]
-            df[column] = (df[column] * 1000.0 * coeff_a + coeff_b) * 1000.0
+        chaves_limpas = {str(k).strip(): k for k in pressure_calibration.coefficient_a.keys()}
+        
+        if instrument and instrument in chaves_limpas:
+            chave_real = chaves_limpas[instrument]
+            A = pressure_calibration.coefficient_a[chave_real]
+            B = pressure_calibration.coefficient_b[chave_real]
+            u_I = pressure_calibration.u_I[chave_real]
+            u_A = pressure_calibration.u_A[chave_real]
+            u_B = pressure_calibration.u_B[chave_real]
+            cov_AB = pressure_calibration.cov_AB[chave_real]
+            
+            I_mA = df[column] * 1000.0
+            P_kPa = A * I_mA + B
+            
+            # Cálculo GUM com proteção contra ruído transiente negativo
+            radicand = (A**2 * u_I**2) + (I_mA**2 * u_A**2) + (u_B**2) + (2 * I_mA * cov_AB)
+            u_P_kPa = np.sqrt(np.clip(radicand, 0, None))
+            
+            df[column] = P_kPa * 1000.0
+            df[f"{column}_u_type_b"] = u_P_kPa * 1000.0 
+        else:
+            df[column] = np.nan
+            df[f"{column}_u_type_b"] = np.nan
 
+    # ==========================================
+    # BUG FIX: Protegendo as incertezas dinâmicas geradas!
+    # ==========================================
     keep_columns = ["timestamp"] + list(measurement_columns.values())
+    
+    for col in list(measurement_columns.values()):
+        if f"{col}_u_type_b" in df.columns:
+            keep_columns.append(f"{col}_u_type_b") # Salva a coluna do apagamento!
+            
     if "Scan" in df.columns: keep_columns = ["Scan"] + keep_columns
 
     result = df[keep_columns].copy()
@@ -218,27 +261,57 @@ def find_longest_true_block(mask: pd.Series) -> Optional[Tuple[int, int]]:
     if best_start == -1: return None
     return best_start, best_end
 
-def compute_steady_state_domains(df: pd.DataFrame, experiment_col: str, time_col: str, temperature_cols: List[str], temp_variation_limit: float, rolling_window: int) -> List[DomainInterval]:
+def compute_steady_state_domains(df: pd.DataFrame, experiment_col: str, time_col: str, temperature_cols: List[str], temp_variation_limit: float, rolling_window: int, max_drift_rate: float) -> List[DomainInterval]:
     domains = []
     for experiment_id, group in df.groupby(experiment_col):
         ordered = group.sort_values(time_col).reset_index(drop=True)
         available_temperature_cols = [column for column in temperature_cols if column in ordered.columns]
-        if len(available_temperature_cols) != len(temperature_cols): continue
+        
+        # Falhou por falta de sensores
+        if len(available_temperature_cols) != len(temperature_cols): 
+            domains.append(DomainInterval(str(experiment_id), pd.NaT, pd.NaT, 0))
+            continue
 
         rolling_ranges = pd.DataFrame(index=ordered.index)
+        rolling_drifts = pd.DataFrame(index=ordered.index)
+        half_w = max(1, rolling_window // 2)
+
         for column in available_temperature_cols:
             rolling_ranges[column] = ordered[column].rolling(window=rolling_window, min_periods=rolling_window).apply(lambda x: float(np.max(x) - np.min(x)), raw=True)
+            mean_recent = ordered[column].rolling(window=half_w, min_periods=half_w).mean()
+            mean_older = mean_recent.shift(half_w)
+            delta_time_min = ordered[time_col].diff(periods=half_w).dt.total_seconds() / 60.0
+            delta_time_min = delta_time_min.replace(0, np.nan)
+            rolling_drifts[column] = (mean_recent - mean_older).abs() / delta_time_min
 
-        steady_mask = (rolling_ranges <= temp_variation_limit).all(axis=1)
+        steady_mask = (rolling_ranges <= temp_variation_limit).all(axis=1) & (rolling_drifts <= max_drift_rate).all(axis=1)
+        
         block = find_longest_true_block(steady_mask)
-        if block is None: continue
-        start_idx = max(0, block[0] - rolling_window + 1)
+        
+        # Falhou por falta de bloco estável
+        if block is None: 
+            domains.append(DomainInterval(str(experiment_id), pd.NaT, pd.NaT, 0))
+            continue
+            
+        # ==========================================
+        # NORMALIZAÇÃO DO DOMÍNIO PARA VARIÂNCIA JUSTA
+        # ==========================================
         end_idx = block[1]
-        domains.append(DomainInterval(str(experiment_id), pd.to_datetime(ordered.loc[start_idx, time_col]), pd.to_datetime(ordered.loc[end_idx, time_col]), end_idx - start_idx + 1))
+        start_idx = max(0, end_idx - rolling_window + 1)
+        pontos_validos = end_idx - start_idx + 1
+
+        domains.append(DomainInterval(
+            str(experiment_id), 
+            pd.to_datetime(ordered.loc[start_idx, time_col]), 
+            pd.to_datetime(ordered.loc[end_idx, time_col]), 
+            pontos_validos
+        ))
+        
     return domains
 
 def filter_by_domains(df: pd.DataFrame, domains: List[DomainInterval], experiment_col: str, time_col: str) -> pd.DataFrame:
-    domain_map = {d.experiment_id: d for d in domains}
+    # FILTRA: Só aplica o domínio se ele de fato tiver pontos válidos (>0)
+    domain_map = {d.experiment_id: d for d in domains if d.points > 0}
     rows = []
     for exp_id, group in df.groupby(experiment_col):
         if str(exp_id) in domain_map:
@@ -264,15 +337,30 @@ def fit_time_trend(df: pd.DataFrame, time_col: str, value_col: str) -> Dict[str,
 
 def summarize_sensors(df: pd.DataFrame, experiment_col: str, group_col: str, sensor_uncertainties: Dict[str, float], confidence_level: float = 0.95) -> pd.DataFrame:
     rows = []
+    
+    # Definimos os sensores possíveis de procurar na bancada
+    sensores_bancada = ["T1", "T2", "T3", "T4", "P1", "P2"]
+
     for (exp_id, grp_id), group in df.groupby([experiment_col, group_col]):
         base = {"experiment_id": exp_id, "replicate_group": grp_id}
-        for sensor, u_b in sensor_uncertainties.items():
+        
+        for sensor in sensores_bancada:
             if sensor in group.columns:
                 u_a, dof_a = standard_uncertainty_type_a(group[sensor])
                 base[f"{sensor}_mean"] = float(group[sensor].mean())
                 base[f"{sensor}_u_type_a"] = u_a
+                
+                # --- IDENTIFICA DE ONDE VEM A INCERTEZA TIPO B ---
+                if f"{sensor}_u_type_b" in group.columns:
+                    # É pressão! Pega a média da coluna dinâmica calculada no GUM
+                    u_b = float(group[f"{sensor}_u_type_b"].mean())
+                else:
+                    # É temperatura! Pega o valor estático do dicionário
+                    u_b = sensor_uncertainties.get(sensor, 0.0)
+                    
                 base[f"{sensor}_u_type_b"] = u_b
                 
+                # Incerteza Combinada e Expandida
                 u_c = float(np.sqrt(u_a**2 + u_b**2))
                 base[f"{sensor}_u_comb_std"] = u_c
                 
@@ -307,143 +395,189 @@ def summarize_balance(df: pd.DataFrame, experiment_col: str, group_col: str) -> 
         })
     return pd.DataFrame(rows)
 
-def grubbs_iterative(grouped: pd.DataFrame, group_col: str, value_col: str, alpha: float = 0.05) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def mad_outlier_test(grouped: pd.DataFrame, group_col: str, value_col: str, threshold: float = 3.5) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Identifica outliers usando o Desvio Absoluto da Mediana (MAD-e) modificado.
+    Método estatístico robusto não-paramétrico, que NÃO exige normalidade dos resíduos.
+    Recomendado por Iglewicz e Hoaglin para amostras pequenas com distribuições desconhecidas.
+    """
     accepted_frames, rejected_rows = [], []
+    
     for group_name, group in grouped.groupby(group_col):
         working = group.copy().reset_index(drop=True)
-        iteration = 1
-        while len(working) >= 3:
+        
+        # Só testa se houver 3 ou mais réplicas. N=1 ou N=2 não têm poder estatístico para detectar outliers.
+        if len(working) >= 3:
             values = working[value_col].to_numpy(dtype=float)
-            mean, std = float(np.mean(values)), float(np.std(values, ddof=1))
-            if std == 0: break
-            deviations = np.abs(values - mean)
-            max_idx = int(np.argmax(deviations))
-            g_stat = float(deviations[max_idx] / std)
-            n = len(working)
-            t_crit = float(t.ppf(1 - alpha / (2 * n), df=n - 2))
-            g_crit = float(((n - 1) / np.sqrt(n)) * np.sqrt((t_crit**2) / (n - 2 + t_crit**2)))
-            if g_stat <= g_crit: break
             
-            rejected = working.iloc[max_idx].copy()
-            rejected["grubbs_iteration"] = iteration
-            rejected["grubbs_stat"] = g_stat
-            rejected["grubbs_critical"] = g_crit
-            rejected_rows.append(rejected)
-            working = working.drop(index=max_idx).reset_index(drop=True)
-            iteration += 1
+            # Calcula a Mediana do grupo (robusta contra o outlier)
+            median_val = np.median(values)
+            
+            # Calcula o Desvio Absoluto de cada ponto para a Mediana
+            abs_deviations = np.abs(values - median_val)
+            
+            # Calcula a Mediana desses Desvios (MAD)
+            mad = np.median(abs_deviations)
+            
+            # Se o MAD for zero (pontos idênticos), não há outlier
+            if mad == 0:
+                accepted_frames.append(working)
+                continue
+                
+            # Calcula o Z-Score Modificado (O fator 0.6745 escala o MAD para uma variância teórica comparável)
+            modified_z_scores = (0.6745 * abs_deviations) / mad
+            
+            # Se o Z-score for maior que o limiar (padrão literatura: 3.5), é outlier
+            outlier_mask = modified_z_scores > threshold
+            
+            if outlier_mask.any():
+                # Separa os rejeitados
+                rejected = working[outlier_mask].copy()
+                rejected["mad_z_score"] = modified_z_scores[outlier_mask]
+                rejected["mad_threshold"] = threshold
+                rejected_rows.append(rejected)
+                
+                # Mantém os aceitos
+                working = working[~outlier_mask].copy()
+        
         accepted_frames.append(working)
+        
     accepted_df = pd.concat(accepted_frames, ignore_index=True) if accepted_frames else grouped.iloc[0:0]
-    rejected_df = pd.DataFrame(rejected_rows) if rejected_rows else grouped.iloc[0:0]
+    rejected_df = pd.concat(rejected_rows, ignore_index=True) if rejected_rows else grouped.iloc[0:0]
+    
     return accepted_df, rejected_df
 
-def combine_replicate_uncertainty(df: pd.DataFrame, group_col: str, value_col: str, inst_u_col: str, inst_dof_col: str, confidence_level: float = 0.95) -> pd.DataFrame:
-    """Combina as incertezas de regressão (internas) com a variabilidade das réplicas (externas)."""
-    rows = []
-    for group_name, group in df.groupby(group_col):
-        n = len(group)
-        group_mean = float(group[value_col].mean())
-        
-        # Propagação da Incerteza da Regressão Linear para a média das réplicas
-        u_inst_arr = group[inst_u_col].to_numpy()
-        dof_inst_arr = group[inst_dof_col].to_numpy()
-        
-        # Incerteza da média devida às regressões: 1/n * sqrt(sum(u_i^2))
-        u_reg_mean = float(np.sqrt(np.sum(u_inst_arr**2)) / n)
-        
-        # Graus de liberdade efetivos da incerteza combinada das regressões
-        if u_reg_mean > 0:
-            num = (np.sum(u_inst_arr**2))**2
-            den = np.sum((u_inst_arr**4) / np.where(dof_inst_arr > 0, dof_inst_arr, np.inf))
-            dof_reg_mean = float(num / den) if den > 0 else np.inf
-        else:
-            dof_reg_mean = np.inf
-        
-        if n > 1:
-            # Variabilidade Tipo A Estatística da Média das réplicas (Variabilidade externa)
-            std_rep = float(np.std(group[value_col].to_numpy(), ddof=1))
-            u_a_rep = std_rep / np.sqrt(n)
-            dof_a_rep = n - 1
-        else:
-            u_a_rep = 0.0
-            dof_a_rep = 0
-            
-        # Combinação estritamente de Incertezas Padrão
-        u_c = float(np.sqrt(u_a_rep**2 + u_reg_mean**2))
-        
-        # Expansão Final (Welch-Satterthwaite)
-        term_a = (u_a_rep**4) / dof_a_rep if dof_a_rep > 0 else 0
-        term_reg = (u_reg_mean**4) / dof_reg_mean if (dof_reg_mean < np.inf and dof_reg_mean > 0) else 0
-        
-        if u_c > 0 and (term_a + term_reg) > 0:
-            dof_eff = (u_c**4) / (term_a + term_reg)
-        else:
-            dof_eff = np.inf
-            
-        k = float(t.ppf((1 + confidence_level) / 2, df=dof_eff)) if dof_eff < np.inf and dof_eff >= 1 else 2.00
-        u_expanded = k * u_c
-            
-        rows.append({
-            "replicate_group": group_name, "n_instances": n, "permeate_rate_mean": group_mean,
-            "u_type_a_rep": u_a_rep, "dof_a_rep": dof_a_rep, 
-            "u_reg_mean": u_reg_mean, "dof_reg_mean": dof_reg_mean,
-            "u_combined_standard": u_c, "dof_eff": dof_eff, "k_factor": k,
-            "u_expanded": u_expanded
-        })
-    return pd.DataFrame(rows)
-
-def chi_square_propagated_uncertainty(accepted_df: pd.DataFrame, group_summary: pd.DataFrame, group_col: str, permeate_col: str, inst_u_col: str, inst_dof_col: str, confidence_level: float = 0.95) -> pd.DataFrame:
-    """Usa a variância agrupada (pooled variance) + Erro da Regressão para experimentos n=1."""
-    replicated_groups = group_summary[group_summary["n_instances"] > 1]
-    if replicated_groups.empty: return pd.DataFrame(columns=[group_col, "u_proxy_type_a", "u_single_expanded"])
-
-    per_group_var = accepted_df.groupby(group_col)[permeate_col].var(ddof=1).dropna()
-    counts = accepted_df.groupby(group_col)[permeate_col].count()
-    rep_vars = per_group_var[per_group_var.index.isin(replicated_groups["replicate_group"])]
-    rep_counts = counts[counts.index.isin(replicated_groups["replicate_group"])]
-    dof_total = int(np.sum(rep_counts - 1))
+def run_normality_and_homoscedasticity_tests(accepted_df: pd.DataFrame, group_col: str, permeate_col: str) -> dict:
+    """Executa o Teste de Shapiro-Wilk (normalidade) e o Teste de Levene (homoscedasticidade)."""
+    df_temp = accepted_df.copy()
     
-    if dof_total <= 0: return pd.DataFrame(columns=[group_col, "u_proxy_type_a", "u_single_expanded"])
-
-    # Raiz da variância agrupada substituindo o limite superior do Qui-Quadrado (Variabilidade base)
-    pooled_var = float(np.sum((rep_counts - 1) * rep_vars) / dof_total)
-    u_proxy_type_a = float(np.sqrt(pooled_var))
-
-    singles = group_summary[group_summary["n_instances"] == 1].copy()
-    if singles.empty: return pd.DataFrame(columns=[group_col, "u_proxy_type_a", "u_single_expanded"])
-
-    singles[group_col] = singles["replicate_group"]
-    single_inst = accepted_df[[group_col, inst_u_col, inst_dof_col]].drop_duplicates(subset=[group_col])
-    singles = singles.merge(single_inst, on=group_col, how="left")
+    # Extrai a temperatura para agrupar
+    df_temp['temp_level'] = df_temp[group_col].astype(str).str.extract(r'\|\s*(\d+(?:\.\d+)?)\s*°?C?')[0].astype(float)
     
-    rows = []
-    for _, row in singles.iterrows():
-        u_reg = float(row[inst_u_col])
-        dof_reg = float(row[inst_dof_col])
+    # 1. Teste de Shapiro-Wilk nos resíduos
+    df_temp['residual'] = df_temp.groupby(group_col)[permeate_col].transform(lambda x: x - x.mean())
+    residuals = df_temp['residual'].dropna().values
+    
+    if len(residuals) >= 3:
+        shapiro_stat, shapiro_p = shapiro(residuals)
+    else:
+        shapiro_stat, shapiro_p = 0.0, 1.0
         
-        # Combina a variância base com o erro da regressão específica do ensaio n=1
-        u_c = float(np.sqrt(u_proxy_type_a**2 + u_reg**2))
+    # 2. Teste de Levene por faixa de temperatura (usando 'median', mais robusto)
+    samples = [group[permeate_col].dropna().values for _, group in df_temp.groupby('temp_level') if len(group.dropna()) > 1]
+    
+    if len(samples) < 2:
+        levene_stat, levene_p = 0.0, 1.0
+    else:
+        levene_stat, levene_p = levene(*samples, center='median')
         
-        # Welch-Satterthwaite para n=1
-        term_proxy = (u_proxy_type_a**4) / dof_total if dof_total > 0 else 0
-        term_reg = (u_reg**4) / dof_reg if dof_reg > 0 else 0
-        
-        if u_c > 0 and (term_proxy + term_reg) > 0:
-            dof_eff = (u_c**4) / (term_proxy + term_reg)
+    return {
+        "shapiro_stat": float(shapiro_stat),
+        "shapiro_p": float(shapiro_p),
+        "is_normal": shapiro_p > 0.05,
+        "levene_stat": float(levene_stat),
+        "levene_p": float(levene_p),
+        "is_homoscedastic": levene_p > 0.05
+    }
+
+def plot_variance_by_temperature(accepted_df: pd.DataFrame, group_col: str, permeate_col: str) -> go.Figure:
+    """Gera um gráfico de barras comparando a variância e o desvio padrão em cada temperatura."""
+    df_temp = accepted_df.copy()
+    df_temp['temp_level'] = df_temp[group_col].astype(str).str.extract(r'\|\s*(\d+(?:\.\d+)?)\s*°?C?')[0].astype(float)
+    
+    stats = df_temp.groupby('temp_level')[permeate_col].agg(
+        variance=lambda x: float(np.var(x, ddof=1)) if len(x) > 1 else 0.0,
+        std_dev='std',
+        count='count'
+    ).reset_index()
+    
+    fig = px.bar(
+        stats, x='temp_level', y='variance', text=stats['variance'].round(4),
+        title="Dispersão da Taxa de Permeado por Faixa de Temperatura (Evidência Física)",
+        labels={'temp_level': 'Temperatura de Entrada Lado Quente (°C)', 'variance': 'Variância Amostral ($s^2$)'},
+        template='plotly_white'
+    )
+    fig.update_traces(textposition='outside', marker_color='indianred')
+    fig.update_layout(
+        yaxis_title="Variância (g/min)²",
+        xaxis_title="Temperatura (°C)",
+        margin=dict(l=20, r=20, t=50, b=20)
+    )
+    return fig
+
+def calculate_stratified_uncertainty(accepted_df: pd.DataFrame, group_col: str, permeate_col: str, confidence_level: float = 0.95) -> pd.DataFrame:
+    """Calcula a incerteza Tipo A Estratificada por Temperatura com Fallback Global para n=1 isolados."""
+    
+    # Extrai a temperatura do nome do grupo
+    temp_series = accepted_df[group_col].astype(str).str.extract(r'\|\s*(\d+(?:\.\d+)?)\s*°?C?')[0]
+    accepted_df['temp_level'] = pd.to_numeric(temp_series, errors='coerce')
+    
+    # Passo 1: Estatísticas brutas de cada grupo
+    group_stats = accepted_df.groupby([group_col, 'temp_level']).agg(
+        permeate_rate_mean=(permeate_col, 'mean'),
+        var_i=(permeate_col, lambda x: float(np.var(x, ddof=1)) if len(x) > 1 else np.nan),
+        n_instances=(permeate_col, 'count')
+    ).reset_index()
+    
+    group_stats['df_i'] = group_stats['n_instances'] - 1
+    
+    # Passo 2: Variância agrupada (Pooled) por faixa de temperatura
+    replicated = group_stats[group_stats['df_i'] > 0]
+    pooled_data = []
+    for temp, t_group in replicated.groupby('temp_level'):
+        df_T = int(t_group['df_i'].sum())
+        if df_T > 0:
+            var_pooled = float(np.sum(t_group['df_i'] * t_group['var_i']) / df_T)
         else:
-            dof_eff = np.inf
+            var_pooled = np.nan
+        pooled_data.append({'temp_level': temp, 'var_pooled': var_pooled, 'df_T': df_T})
+        
+    pooled_df = pd.DataFrame(pooled_data)
+    
+    if not pooled_df.empty:
+        report = group_stats.merge(pooled_df, on='temp_level', how='left')
+    else:
+        report = group_stats.copy()
+        report['var_pooled'] = np.nan
+        report['df_T'] = 0
+        
+    # FALLBACK GLOBAL: Se uma temperatura inteira não tiver nenhuma réplica, 
+    # usamos a média de todas as variâncias disponíveis na bancada (ou Qui-Quadrado global).
+    global_mean_var = pooled_df['var_pooled'].mean() if not pooled_df.empty else 0.01
+    global_df_total = int(pooled_df['df_T'].sum()) if not pooled_df.empty else 1
+    
+    # Passo 3: Propagação da Incerteza com suporte a patamares vazios
+    rows = []
+    for _, row in report.iterrows():
+        var_p = row['var_pooled']
+        df_p = row['df_T']
+        n = row['n_instances']
+        mean_val = row['permeate_rate_mean']
+        
+        # Se a temperatura não tem réplica própria, aplica o fallback estatístico global
+        if pd.isna(var_p) or df_p <= 0:
+            var_p = global_mean_var
+            df_p = max(1, global_df_total)
             
-        k = float(t.ppf((1 + confidence_level) / 2, df=dof_eff)) if dof_eff < np.inf and dof_eff >= 1 else 2.00
+        u_proxy = float(np.sqrt(var_p))
+        u_c = float(np.sqrt(var_p / n))
+        dof_eff = df_p
+        
+        k = float(t.ppf((1 + confidence_level) / 2, df=dof_eff)) if dof_eff >= 1 else 2.00
         u_expanded = k * u_c
+        
+        incerteza_relativa = (u_expanded / mean_val * 100) if mean_val != 0 else np.nan
         
         rows.append({
             group_col: row[group_col],
-            "u_proxy_type_a": u_proxy_type_a,
-            "u_reg_single": u_reg,
-            "dof_proxy": dof_total,
-            "u_single_combined_standard": u_c,
+            "n_instances": n,
+            "permeate_rate_mean": mean_val,
+            "u_proxy_type_a": u_proxy,
+            "u_combined_standard": u_c,
             "dof_eff": dof_eff,
             "k_factor": k,
-            "u_single_expanded": u_expanded
+            "reported_uncertainty": u_expanded,
+            "incerteza_relativa_perc": incerteza_relativa
         })
         
     return pd.DataFrame(rows)
@@ -519,32 +653,26 @@ def build_grouping_tables(registry: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Data
         singles[["group_display_name", "experimento", "flow_setting", "hot_side_inlet_setting"]].rename(columns={"experimento": "experiment_id"}).reset_index(drop=True),
     )
 
-def build_final_report(group_summary: pd.DataFrame, chi_single: pd.DataFrame, sensors_summary: pd.DataFrame, registry: pd.DataFrame) -> pd.DataFrame:
+def build_final_report(uncertainty_summary: pd.DataFrame, sensors_summary: pd.DataFrame, registry: pd.DataFrame) -> pd.DataFrame:
     group_metadata = registry.drop_duplicates(subset=["replicate_group"])[
         ["replicate_group", "group_display_name", "experiments_label", "flow_setting", "hot_side_inlet_setting", "flow_ml_min", "hot_temp_c"]
     ].copy()
     
-    report = group_summary.merge(group_metadata, on="replicate_group", how="left")
-    report = report.merge(chi_single[["replicate_group", "u_single_combined_standard", "u_single_expanded", "u_proxy_type_a", "u_reg_single"]], on="replicate_group", how="left")
+    report = uncertainty_summary.merge(group_metadata, on="replicate_group", how="left")
     
-    # Faz a união com os dados dos sensores processados
     if not sensors_summary.empty:
         report = report.merge(sensors_summary, on="replicate_group", how="left")
     
     report["report_type"] = np.where(report["n_instances"] > 1, "grupo com réplicas", "experimento único")
-    
-    # A incerteza final reportada assume a Expansão de Confiança baseada no k final
-    report["reported_uncertainty"] = np.where(report["n_instances"] > 1, report["u_expanded"], report["u_single_expanded"])
     report["report_label"] = report["group_display_name"]
     
     keep_columns = [
         "replicate_group", "report_label", "report_type", "experiments_label",
         "flow_setting", "hot_side_inlet_setting", "flow_ml_min", "hot_temp_c",
-        "permeate_rate_mean", "reported_uncertainty", "n_instances",
-        "u_type_a_rep", "u_proxy_type_a", "u_reg_mean", "u_reg_single", "u_combined_standard", "dof_eff", "k_factor"
+        "permeate_rate_mean", "reported_uncertainty", "incerteza_relativa_perc", 
+        "n_instances", "u_proxy_type_a", "u_combined_standard", "dof_eff", "k_factor"
     ]
     
-    # Adiciona as colunas dos sensores dinamicamente para exibição final
     for col in sensors_summary.columns:
         if col != "replicate_group" and col not in keep_columns:
             keep_columns.append(col)
@@ -637,9 +765,14 @@ steady_state_temperature_cols = ["T1", "T2", "T3", "T4"]
 
 with st.sidebar:
     st.header("⚙️ Parâmetros de Análise")
-    temp_variation_limit = st.number_input("Var. máx. temp. (°C)", min_value=0.0, value=0.5, step=0.05)
-    rolling_window = st.number_input("Janela estabilidade (pontos)", min_value=3, value=10, step=1)
-    grubbs_alpha = st.number_input("Alpha do Grubbs", min_value=0.001, max_value=0.2, value=0.05, step=0.001)
+    temp_variation_limit = st.number_input("Var. máx. temp. (°C)", min_value=0.0, value=2.00, step=0.50)
+    rolling_window = st.number_input("Janela estabilidade (pontos)", min_value=3, value=300, step=60)
+
+    max_drift_rate = st.number_input("Taxa máx. deriva (°C/min)", min_value=0.001, max_value=2.0, value=0.03, step=0.01)
+    
+    mad_threshold = st.number_input("Corte do Outlier (MAD Z-Score)", min_value=1.5, max_value=5.0, value=3.5, step=0.5, 
+                                    help="Use 3.5 para alta rigidez (ISO). Valores menores ejetam mais facilmente.")
+
     confidence_level = st.number_input("Nível de Confiança", min_value=0.80, max_value=0.999, value=0.95, step=0.01)
     
     st.divider()
@@ -652,7 +785,11 @@ with st.sidebar:
 agilent_df = ensure_replicate_group(workspace.agilent.copy())
 balance_df = ensure_replicate_group(workspace.balance.copy())
 
-domains = compute_steady_state_domains(agilent_df, "experiment_id", "timestamp", steady_state_temperature_cols, temp_variation_limit, int(rolling_window))
+domains = compute_steady_state_domains(
+    agilent_df, "experiment_id", "timestamp", steady_state_temperature_cols, 
+    temp_variation_limit, int(rolling_window), float(max_drift_rate)
+)
+
 if not domains:
     st.error("Nenhum domínio detectado. Aumente a variação máxima permitida.")
     st.stop()
@@ -668,14 +805,18 @@ instance_summary = summarize_sensors(agilent_domain_df, "experiment_id", "replic
 balance_summary = summarize_balance(balance_domain_df, "experiment_id", "replicate_group")
 instance_summary = instance_summary.merge(balance_summary, on=["experiment_id", "replicate_group"], how="left")
 
-# Teste Grubbs Exclusivo para Taxa de Permeado
-accepted_instances, rejected_instances = grubbs_iterative(instance_summary, "replicate_group", "permeate_rate", float(grubbs_alpha))
-group_summary = combine_replicate_uncertainty(accepted_instances, "replicate_group", "permeate_rate", "permeate_rate_u_a_reg", "permeate_rate_dof_reg", float(confidence_level))
-chi_single = chi_square_propagated_uncertainty(accepted_instances, group_summary, "replicate_group", "permeate_rate", "permeate_rate_u_a_reg", "permeate_rate_dof_reg", float(confidence_level))
+#teste não-paramétrico:
+accepted_instances, rejected_instances = mad_outlier_test(instance_summary, "replicate_group", "permeate_rate", threshold=3.5)
+
+# EXECUTAR TESTES DE PRESSUPOSISTOS (Shapiro-Wilk + Bartlett)
+stats_validation = run_normality_and_homoscedasticity_tests(accepted_instances, "replicate_group", "permeate_rate")
+
+# Cálculo da Incerteza Estratificada por Temperatura
+uncertainty_summary = calculate_stratified_uncertainty(accepted_instances, "replicate_group", "permeate_rate", float(confidence_level))
 
 # Consolidação dos Sensores para a tabela final
 sensors_summary = aggregate_sensors(accepted_instances, sensor_columns, float(confidence_level))
-final_report = build_final_report(group_summary, chi_single, sensors_summary, experiment_registry)
+final_report = build_final_report(uncertainty_summary, sensors_summary, experiment_registry)
 
 # Visualizações
 if view_mode == "Visão Geral":
@@ -696,26 +837,85 @@ if view_mode == "Visão Geral":
         st.dataframe(final_report, use_container_width=True, hide_index=True)
 
     with tab2:
-        st.subheader("Outliers Detectados (Teste de Grubbs)")
+       with tab2:
+        st.subheader("Outliers Detectados (Teste MAD Modificado)")
         if not rejected_instances.empty:
             st.error(f"Foram rejeitados {len(rejected_instances)} experimento(s) baseados na taxa calculada.")
-            outliers_view = rejected_instances[["experiment_id", "replicate_group", "permeate_rate", "grubbs_stat", "grubbs_critical"]]
-            outliers_view = outliers_view.rename(columns={"permeate_rate": "Taxa Rejeitada (g/min)", "grubbs_stat": "Estatística Grubbs", "grubbs_critical": "Limite Crítico"})
+            outliers_view = rejected_instances[["experiment_id", "replicate_group", "permeate_rate", "mad_z_score", "mad_threshold"]]
+            outliers_view = outliers_view.rename(columns={
+                "permeate_rate": "Taxa Rejeitada (g/min)", 
+                "mad_z_score": "Z-Score Modificado (MAD)", 
+                "mad_threshold": "Limite Crítico"
+            })
             st.dataframe(outliers_view, use_container_width=True, hide_index=True)
         else:
-            st.success("Nenhum experimento foi caracterizado como anomalia (outlier) pelo Grubbs.")
+            st.success("Nenhum experimento foi caracterizado como anomalia (outlier) pelo teste do MAD.")
 
         st.divider()
+        
         st.subheader("Domínios de Regime Permanente")
-        st.dataframe(pd.DataFrame([d.__dict__ for d in domains]), use_container_width=True, hide_index=True)
+        
+        # Converte para DataFrame
+        domain_df = pd.DataFrame([d.__dict__ for d in domains])
+        
+        # Cria uma coluna numérica temporária para forçar a ordenação matemática (1, 2, 3...)
+        domain_df["exp_num"] = pd.to_numeric(domain_df["experiment_id"], errors="coerce")
+        domain_df = domain_df.sort_values("exp_num").drop(columns=["exp_num"])
+        
+        # Adiciona a coluna de Status
+        domain_df["status"] = np.where(domain_df["points"] > 0, "✔️ Atingido", "❌ Falhou")
+        
+        # Formata as datas para não mostrar o "NaT" feio no Streamlit
+        domain_df["start_time"] = domain_df["start_time"].dt.strftime("%Y-%m-%d %H:%M:%S").fillna("-")
+        domain_df["end_time"] = domain_df["end_time"].dt.strftime("%Y-%m-%d %H:%M:%S").fillna("-")
+        
+        # Reorganiza as colunas para ficar visualmente amigável
+        domain_df = domain_df[["experiment_id", "status", "start_time", "end_time", "points"]]
+        
+        st.dataframe(domain_df, use_container_width=True, hide_index=True)
 
-        st.subheader("Propagação das Incertezas (GUM)")
-        with st.expander("Incerteza Combinada (Grupos de Réplicas)"): st.dataframe(group_summary, use_container_width=True, hide_index=True)
-        with st.expander("Incerteza Testes Únicos (Pooled Variance + Erro Regressão)"): st.dataframe(chi_single, use_container_width=True, hide_index=True)
-
+        st.divider()
+       
+        st.subheader("Validação de Pressupostos Estatísticos")
+        st.caption("Verificação da normalidade (Shapiro-Wilk) e da homoscedasticidade (Teste de Levene, adequado para dados não-normais).")
+        
+        # Bloco de Métricas do Shapiro-Wilk (Normalidade)
+        st.markdown("##### 1. Teste de Normalidade dos Resíduos (Shapiro-Wilk)")
+        col_s1, col_s2, col_s3 = st.columns(3)
+        col_s1.metric("Estatística W", f"{stats_validation['shapiro_stat']:.4f}")
+        col_s2.metric("Valor-p (p-value)", f"{stats_validation['shapiro_p']:.4f}")
+        status_norm = "✅ Normal (p > 0.05)" if stats_validation['is_normal'] else "⚠️ Não-normal (p <= 0.05 - Justifica o uso de Levene)"
+        col_s3.metric("Conclusão Normalidade", status_norm)
+        
+        st.divider()
+        
+        # Bloco de Métricas do Levene (Homoscedasticidade)
+        st.markdown("##### 2. Teste de Homoscedasticidade (Teste de Levene)")
+        col_l1, col_l2, col_l3 = st.columns(3)
+        col_l1.metric("Estatística de Levene", f"{stats_validation['levene_stat']:.2f}")
+        col_l2.metric("Valor-p (p-value)", f"{stats_validation['levene_p']:.4f}")
+        status_homo = "✅ Homoscedástico" if stats_validation['is_homoscedastic'] else "⚠️ Heteroscedástico (Estratificação Térmica Necessária)"
+        col_l3.metric("Conclusão Variância", status_homo)
+        
+        if not stats_validation['is_homoscedastic']:
+            st.info(
+                "💡 **Justificativa Metodológica:** Como os dados não atendem à premissa de normalidade estrita, o Teste de Levene (centrado na mediana) "
+                "foi empregado com sucesso. O resultado (p < 0,05) confirma estatisticamente a heteroscedasticidade e valida a adoção do "
+                "**Agrupamento Estratificado por Temperatura** na propagação de incertezas."
+            )
+        
+        # Exibe o Gráfico de Barras da Variância por Temperatura
+        st.divider()
+        fig_var = plot_variance_by_temperature(accepted_instances, "replicate_group", "permeate_rate")
+        st.plotly_chart(fig_var, use_container_width=True)
+        
+        st.divider()
+        st.subheader("Propagação das Incertezas (GUM - Estratificada)")
+        st.dataframe(uncertainty_summary, use_container_width=True, hide_index=True)
+        
     with tab3:
         st.subheader("Tabelas Estruturais")
-        with st.expander("Mapeamento de Sensores"): st.dataframe(pd.DataFrame([{"Sensor": k, "Incerteza": v} for k, v in workspace.sensor_uncertainties.items()]), use_container_width=True, hide_index=True)
+        with st.expander("Mapeamento de Sensores"): st.dataframe(pd.DataFrame([{"Sensor": k, "Incerteza padrão": v} for k, v in workspace.sensor_uncertainties.items()]), use_container_width=True, hide_index=True)
         with st.expander("Mapeamento de Grupos"): st.dataframe(replicate_groups_table, use_container_width=True, hide_index=True)
         with st.expander("Dados Brutos Agilent (Top 500)"): st.dataframe(workspace.agilent.head(500), use_container_width=True)
         with st.expander("Dados Brutos Balança (Top 500)"): st.dataframe(workspace.balance.head(500), use_container_width=True)
