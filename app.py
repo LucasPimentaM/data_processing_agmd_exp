@@ -21,6 +21,7 @@ SENSOR_MAP_FILE = AUX_DIR / "mapeamento_sensor_output.csv"
 EXPERIMENT_MAP_FILE = AUX_DIR / "mapeamento_experimentos_parametros.csv"
 UNCERTAINTY_FILE = AUX_DIR / "incertezas_instrumentais.csv"
 PRESSURE_CALIBRATION_FILE = AUX_DIR / "relacao_corrente_pressao.csv"
+GRAVIMETRIC_MAP_FILE = AUX_DIR / "mapeamento_bomba_gravimetrica.csv"
 
 # ==========================================
 # CONTROLE DE EXCEÇÕES E DADOS COMPROMETIDOS
@@ -148,6 +149,50 @@ def _load_sensor_reference(
 
     return sensor_code_to_name, sensor_titles, sensor_uncertainties, pressure_calibration
 
+def apply_pump_calibration(agilent_df: pd.DataFrame, experiment_metadata: pd.DataFrame) -> pd.DataFrame:
+    """Busca a vazão gravimétrica real da bomba com base na data do experimento do Agilent."""
+    meta = experiment_metadata.copy()
+    meta["flow_real_ml_min"] = meta["flow_ml_min"]
+    meta["flow_u_bomba"] = 0.0
+    
+    if not GRAVIMETRIC_MAP_FILE.exists():
+        return meta
+        
+    calib_df = pd.read_csv(GRAVIMETRIC_MAP_FILE)
+    # Converte as datas das pastas (ex: '08_05_2026') para datetime
+    calib_df['data_calib'] = pd.to_datetime(calib_df['Data_Teste'], format='%d_%m_%Y')
+    
+    # Extrai o Timestamp exato em que cada experimento iniciou
+    exp_dates = agilent_df.groupby('experiment_id')['timestamp'].min().reset_index()
+    exp_dates = exp_dates.rename(columns={'timestamp': 'exp_date'})
+    
+    # Cruza a tabela mestre com as datas
+    meta = meta.merge(exp_dates, left_on='experimento', right_on='experiment_id', how='left')
+    
+    for idx, row in meta.iterrows():
+        exp_date = row['exp_date']
+        nominal = row['flow_ml_min']
+        
+        if pd.isna(exp_date) or pd.isna(nominal): continue
+            
+        # Pega todas as calibrações que ocorreram ANTES ou NO MESMO DIA do experimento
+        valid_calibs = calib_df[calib_df['data_calib'] <= exp_date]
+        
+        # Se o ensaio for mais antigo que a 1ª calibração, usa a 1ª como referência
+        if valid_calibs.empty: valid_calibs = calib_df
+            
+        # Pega a calibração válida mais recente
+        target_date = valid_calibs['data_calib'].max()
+        
+        # Encontra a curva exata para o nível nominal (800, 1000 ou 1200)
+        match = calib_df[(calib_df['data_calib'] == target_date) & (calib_df['Vazao_Alvo_Nominal'] == nominal)]
+        
+        if not match.empty:
+            meta.at[idx, 'flow_real_ml_min'] = match.iloc[0]['Vazao_Real_Media']
+            meta.at[idx, 'flow_u_bomba'] = match.iloc[0]['Incerteza_uA_Bomba']
+            
+    return meta.drop(columns=['experiment_id', 'exp_date'], errors='ignore')
+
 def _load_agilent_file(path: Path, experiment_id: str, replicate_group: str, sensor_code_to_name: Dict[str, str], pressure_calibration: PressureCalibration) -> pd.DataFrame:
     df = pd.read_csv(path, encoding="utf-16", skiprows=14)
     measurement_columns = {col: sensor_code_to_name[m.group(1)] for col in df.columns if (m := re.match(r"^(\d+)\s+<.*>", str(col))) and m.group(1) in sensor_code_to_name}
@@ -236,13 +281,20 @@ def load_workspace_data() -> WorkspaceData:
 
     agilent_df = pd.concat(agilent_frames, ignore_index=True) if agilent_frames else pd.DataFrame()
     balance_df = pd.concat(balance_frames, ignore_index=True) if balance_frames else pd.DataFrame()
-    metadata_for_merge = experiment_metadata[["experimento", "flow_setting", "hot_side_inlet_setting"]].copy()
-
-    if not agilent_df.empty: agilent_df = agilent_df.merge(metadata_for_merge, left_on="experiment_id", right_on="experimento", how="left")
-    if not balance_df.empty: balance_df = balance_df.merge(metadata_for_merge, left_on="experiment_id", right_on="experimento", how="left")
+    
+    # --- NOVO BLOCO (Substitui o antigo) ---
+    if not agilent_df.empty:
+        # Chama a mágica da calibração
+        experiment_metadata = apply_pump_calibration(agilent_df, experiment_metadata)
+        
+        metadata_for_merge = experiment_metadata[["experimento", "flow_setting", "hot_side_inlet_setting", "flow_real_ml_min"]].copy()
+        
+        agilent_df = agilent_df.merge(metadata_for_merge, left_on="experiment_id", right_on="experimento", how="left")
+        if not balance_df.empty: 
+            balance_df = balance_df.merge(metadata_for_merge, left_on="experiment_id", right_on="experimento", how="left")
+    # ---------------------------------------
 
     return WorkspaceData(agilent_df, balance_df, sensor_uncertainties, experiment_metadata, sensor_titles)
-
 
 # ==========================================
 # FUNÇÕES ESTATÍSTICAS E MATEMÁTICAS (METROLOGIA GUM)
@@ -653,22 +705,132 @@ def build_grouping_tables(registry: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Data
         singles[["group_display_name", "experimento", "flow_setting", "hot_side_inlet_setting"]].rename(columns={"experimento": "experiment_id"}).reset_index(drop=True),
     )
 
+def water_density_g_ml(T: pd.Series) -> pd.Series:
+    """
+    Calcula a densidade da água líquida (g/mL) em função da temperatura (°C)
+    usando a formulação de Kell (1975).
+    """
+    num = (999.83952 + 16.945176 * T - 7.9870401e-3 * T**2 - 
+           46.170461e-6 * T**3 + 105.56302e-9 * T**4 - 280.54253e-12 * T**5)
+    den = 1 + 16.897850e-3 * T
+    return (num / den) / 1000.0  # Retorna em g/mL (equivalente a kg/L)
+
+def calculate_energy_metrics(report_df: pd.DataFrame) -> pd.DataFrame:
+    """Calcula STEC, GOR, propagação de incerteza expandida (GUM) e incerteza percentual."""
+    df = report_df.copy()
+    
+    # Constantes termodinâmicas
+    cp_water = 4.184  # Calor específico da água (J/g·°C)
+    h_fg = 2257.0     # Calor latente de vaporização da água (J/g)
+    
+    # 1. Extração dos Valores Nominais
+    V_h = pd.to_numeric(df.get("flow_real_mean", np.nan), errors="coerce")
+    m_p = pd.to_numeric(df.get("permeate_rate_mean", np.nan), errors="coerce") 
+    T_in = pd.to_numeric(df.get("T1_mean", np.nan), errors="coerce") 
+    T_out = pd.to_numeric(df.get("T2_mean", np.nan), errors="coerce") 
+    
+    # 2. Extração das Incertezas Expandidas
+    u_V_h = pd.to_numeric(df.get("flow_real_u_expanded", 0.0), errors="coerce")
+    u_m_p = pd.to_numeric(df.get("reported_uncertainty", 0.0), errors="coerce")
+    u_T_in = pd.to_numeric(df.get("T1_u_expanded", 0.0), errors="coerce")
+    u_T_out = pd.to_numeric(df.get("T2_u_expanded", 0.0), errors="coerce")
+
+    # 3. Correção Dinâmica de Densidade (Avaliando na temperatura média do canal)
+    T_avg = (T_in + T_out) / 2.0
+    rho = water_density_g_ml(T_avg)
+    
+    m_h = V_h * rho
+    u_m_h = u_V_h * rho
+    
+    # 4. Cálculos Nominais de Balanço
+    delta_T = T_in - T_out
+    Q_in = m_h * cp_water * delta_T
+    
+    df["GOR"] = np.where((Q_in > 0) & (m_p > 0), (m_p * h_fg) / Q_in, np.nan)
+    df["STEC_kWh_m3"] = np.where((m_p > 0), Q_in / (m_p * 3.6), np.nan)
+    df["rho_avg_g_ml"] = rho
+    
+    # 5. Propagação de Incerteza Relativa e Percentual
+    u_delta_T = np.sqrt(u_T_in**2 + u_T_out**2)
+    
+    rel_unc = np.sqrt(
+        (u_m_h / m_h)**2 + 
+        (u_m_p / m_p)**2 + 
+        (u_delta_T / delta_T)**2
+    )
+    
+    df["GOR_u_expanded"] = df["GOR"] * rel_unc
+    df["STEC_u_expanded"] = df["STEC_kWh_m3"] * rel_unc
+    
+    # Nova coluna de incerteza percentual unificada para as métricas energéticas
+    df["energy_relative_unc_perc"] = rel_unc * 100
+    
+    return df
+
 def build_final_report(uncertainty_summary: pd.DataFrame, sensors_summary: pd.DataFrame, registry: pd.DataFrame) -> pd.DataFrame:
     group_metadata = registry.drop_duplicates(subset=["replicate_group"])[
         ["replicate_group", "group_display_name", "experiments_label", "flow_setting", "hot_side_inlet_setting", "flow_ml_min", "hot_temp_c"]
     ].copy()
     
-    report = uncertainty_summary.merge(group_metadata, on="replicate_group", how="left")
+    # ==========================================
+    # CÁLCULO GUM: Agrupamento da Vazão Real
+    # ==========================================
+    flow_stats_list = []
+    for group_name, group in registry.groupby("replicate_group"):
+        n = len(group)
+        real_flows = group["flow_real_ml_min"].dropna().to_numpy()
+        u_bombas = group["flow_u_bomba"].dropna().to_numpy() # Incertezas Padrão da calibração
+        
+        if len(real_flows) == 0:
+            flow_stats_list.append({"replicate_group": group_name, "flow_real_mean": np.nan, "flow_real_u_expanded": np.nan})
+            continue
+            
+        mean_flow = float(np.mean(real_flows))
+        
+        # Tipo A: Variação da vazão real entre as réplicas
+        if len(real_flows) > 1:
+            u_A_flow = float(np.std(real_flows, ddof=1) / np.sqrt(n))
+            dof_A = n - 1
+        else:
+            u_A_flow = 0.0
+            dof_A = 0
+            
+        # Tipo B: Incerteza combinada (RMS) das calibrações da bomba
+        u_B_flow = float(np.sqrt(np.mean(u_bombas**2))) if len(u_bombas) > 0 else 0.0
+        
+        # Incerteza Combinada Padrão e Graus de Liberdade (Welch-Satterthwaite)
+        u_c_flow = np.sqrt(u_A_flow**2 + u_B_flow**2)
+        
+        if u_A_flow > 0:
+            dof_eff = (u_c_flow**4) / ((u_A_flow**4) / dof_A)
+            k_flow = float(t.ppf((1 + 0.95) / 2, df=dof_eff)) if dof_eff >= 1 else 2.00
+        else:
+            k_flow = 2.00
+            
+        flow_stats_list.append({
+            "replicate_group": group_name,
+            "flow_real_mean": round(mean_flow, 2),
+            "flow_real_u_expanded": round(k_flow * u_c_flow, 4)
+        })
+        
+    flow_stats_df = pd.DataFrame(flow_stats_list)
+    group_metadata = group_metadata.merge(flow_stats_df, on="replicate_group", how="left")
     
+    # Mescla tudo
+    report = uncertainty_summary.merge(group_metadata, on="replicate_group", how="left")
     if not sensors_summary.empty:
         report = report.merge(sensors_summary, on="replicate_group", how="left")
-    
+        
     report["report_type"] = np.where(report["n_instances"] > 1, "grupo com réplicas", "experimento único")
     report["report_label"] = report["group_display_name"]
     
+   # ==========================================
+    # ORGANIZAÇÃO FINAL DAS COLUNAS (LÓGICA INTERNA)
+    # ==========================================
     keep_columns = [
         "replicate_group", "report_label", "report_type", "experiments_label",
-        "flow_setting", "hot_side_inlet_setting", "flow_ml_min", "hot_temp_c",
+        "flow_setting", "hot_side_inlet_setting", "hot_temp_c", "flow_ml_min", # <-- Mantidos para o gráfico usar!
+        "flow_real_mean", "flow_real_u_expanded", 
         "permeate_rate_mean", "reported_uncertainty", "incerteza_relativa_perc", 
         "n_instances", "u_proxy_type_a", "u_combined_standard", "dof_eff", "k_factor"
     ]
@@ -678,50 +840,145 @@ def build_final_report(uncertainty_summary: pd.DataFrame, sensors_summary: pd.Da
             keep_columns.append(col)
             
     for col in keep_columns:
-        if col not in report.columns:
-            report[col] = np.nan
+        if col not in report.columns: report[col] = np.nan
             
-    return report[keep_columns].sort_values(["flow_ml_min", "hot_temp_c", "replicate_group"], na_position="last").reset_index(drop=True)
+    # Retorna o dataframe original para NÃO quebrar os gráficos!
+    report = report.sort_values(["flow_real_mean", "hot_temp_c", "replicate_group"], na_position="last")
+    return report[keep_columns].reset_index(drop=True)
 
 # ==========================================
 # GERAÇÃO DE GRÁFICOS (2D LINHAS)
 # ==========================================
-def plot_2d_faceted_lines(report_df: pd.DataFrame) -> Tuple[go.Figure, go.Figure]:
+# Mude a definição da função para receber as listas selecionadas
+def plot_2d_faceted_lines(report_df: pd.DataFrame, sel_temps: list, sel_flows: list) -> Tuple[go.Figure, go.Figure]:
     plot_df = report_df.copy()
+    
     plot_df["reported_uncertainty"] = pd.to_numeric(plot_df["reported_uncertainty"], errors="coerce")
     plot_df["permeate_rate_mean"] = pd.to_numeric(plot_df["permeate_rate_mean"], errors="coerce")
-    plot_df["flow_ml_min"] = pd.to_numeric(plot_df["flow_ml_min"], errors="coerce")
+    plot_df["flow_real_mean"] = pd.to_numeric(plot_df["flow_real_mean"], errors="coerce")
+    plot_df["flow_real_u_expanded"] = pd.to_numeric(plot_df["flow_real_u_expanded"], errors="coerce")
     plot_df["hot_temp_c"] = pd.to_numeric(plot_df["hot_temp_c"], errors="coerce")
-    plot_df = plot_df.dropna(subset=["permeate_rate_mean", "flow_ml_min", "hot_temp_c"])
+    plot_df["flow_ml_min"] = pd.to_numeric(plot_df["flow_ml_min"], errors="coerce")
     
-    plot_df["Temp_Label"] = plot_df["hot_temp_c"].astype(str) + " °C"
-    plot_df["Flow_Label"] = plot_df["flow_ml_min"].astype(str) + " mL/min"
+    plot_df = plot_df.dropna(subset=["permeate_rate_mean", "flow_real_mean", "hot_temp_c"])
+    
+    # CRIAR DATAFRAMES SEPARADOS E FILTRADOS PARA CADA GRÁFICO
+    df_g1 = plot_df[plot_df["hot_temp_c"].isin(sel_temps)].copy()
+    df_g2 = plot_df[plot_df["flow_ml_min"].isin(sel_flows)].copy()
+    
+    # Aplica Labels no G1
+    df_g1["Temp_Label"] = df_g1["hot_temp_c"].apply(lambda x: f"{x:02.0f} °C (Target)")
+    temp_order = sorted(df_g1["Temp_Label"].unique())
 
-    # Gráfico 1: Variação da Vazão (X) para cada Temperatura Fixada (Cor)
+    # ==========================================
+    # Gráfico 1: Usando df_g1
+    # ==========================================
     fig_flow = px.line(
-        plot_df.sort_values(["flow_ml_min", "hot_temp_c"]),
-        x="flow_ml_min", y="permeate_rate_mean", color="Temp_Label",
-        markers=True, error_y="reported_uncertainty",
-        title="Impacto da Vazão na Taxa de Permeado (Para cada Temperatura)",
-        labels={"flow_ml_min": "Vazão (mL/min)", "permeate_rate_mean": "Taxa de Permeado (g/min)", "Temp_Label": "Temperatura Fixada"},
-        template="plotly_white"
+        df_g1.sort_values(["flow_real_mean", "hot_temp_c"]),
+        x="flow_real_mean", 
+        y="permeate_rate_mean", 
+        color="Temp_Label",
+        symbol="Temp_Label", 
+        markers=True, 
+        error_y="reported_uncertainty", 
+        error_x="flow_real_u_expanded", 
+        hover_data={"flow_ml_min": True},
+        category_orders={"Temp_Label": temp_order}, 
+        title="Effect of Measured Flow Rate on Permeate Flux",
+        labels={
+            "flow_real_mean": "Measured Gravimetric Flow Rate (mL/min)", 
+            "permeate_rate_mean": "Permeate Flux (g/min)", 
+            "Temp_Label": "Target Temperature",
+            "flow_ml_min": "Target Flow (Nominal)"
+        },
+        template="simple_white",
+        color_discrete_sequence=px.colors.sequential.Plasma_r 
     )
-    fig_flow.update_traces(marker=dict(size=10))
-    fig_flow.update_layout(margin=dict(l=10, r=10, t=50, b=10))
+    fig_flow.update_traces(
+        error_y=dict(thickness=1.5, width=4, color='rgba(100,100,100,0.5)'),
+        error_x=dict(thickness=1.5, width=4, color='rgba(100,100,100,0.5)'),
+        marker=dict(size=8, line=dict(width=1, color='DarkSlateGrey'))
+    )
+    fig_flow.update_layout(font=dict(family="Times New Roman", size=14), legend=dict(title_font_family="Times New Roman"), margin=dict(l=10, r=10, t=50, b=10))
 
-    # Gráfico 2: Variação da Temperatura (X) para cada Vazão Fixada (Cor)
+    # Aplica Labels no G2 (Ordem matemática real sem o zero na frente)
+    numeric_flows = sorted(df_g2["flow_ml_min"].unique())
+    flow_order = [f"{x:.0f} mL/min (Target)" for x in numeric_flows]
+    df_g2["Flow_Label"] = df_g2["flow_ml_min"].apply(lambda x: f"{x:.0f} mL/min (Target)")
+
+    # ==========================================
+    # Gráfico 2: Usando df_g2
+    # ==========================================
+    if "T1_mean" in df_g2.columns and "T1_u_expanded" in df_g2.columns:
+        x_col, error_x_col, x_label = "T1_mean", "T1_u_expanded", "Measured Hot Inlet Temperature - T1 (°C)"
+        df_g2[x_col] = pd.to_numeric(df_g2[x_col], errors="coerce")
+        df_g2[error_x_col] = pd.to_numeric(df_g2[error_x_col], errors="coerce")
+    else:
+        x_col, error_x_col, x_label = "hot_temp_c", None, "Target Hot Inlet Temperature (°C)"
+
     fig_temp = px.line(
-        plot_df.sort_values(["hot_temp_c", "flow_ml_min"]),
-        x="hot_temp_c", y="permeate_rate_mean", color="Flow_Label",
-        markers=True, error_y="reported_uncertainty",
-        title="Impacto da Temperatura na Taxa de Permeado (Para cada Vazão)",
-        labels={"hot_temp_c": "Temperatura Quente (°C)", "permeate_rate_mean": "Taxa de Permeado (g/min)", "Flow_Label": "Vazão Fixada"},
-        template="plotly_white"
+        df_g2.sort_values(["Flow_Label", x_col]),
+        x=x_col, 
+        y="permeate_rate_mean", 
+        color="Flow_Label",
+        symbol="Flow_Label", 
+        markers=True, 
+        error_y="reported_uncertainty",
+        error_x=error_x_col, 
+        hover_data={"hot_temp_c": True, "flow_real_mean": ":.1f", "flow_real_u_expanded": ":.2f", "Flow_Label": False}, 
+        category_orders={"Flow_Label": flow_order},
+        title="Effect of Measured Temperature on Permeate Flux",
+        labels={x_col: x_label, "permeate_rate_mean": "Permeate Flux (g/min)", "Flow_Label": "Target Flow Rate", "hot_temp_c": "Target Temp.", "flow_real_mean": "Real Flow", "flow_real_u_expanded": "Flow Unc. (±)"},
+        template="simple_white",
+        color_discrete_sequence=px.colors.sequential.Viridis_r 
     )
-    fig_temp.update_traces(marker=dict(size=10))
-    fig_temp.update_layout(margin=dict(l=10, r=10, t=50, b=10))
+    fig_temp.update_traces(
+        error_y=dict(thickness=1.5, width=4, color='rgba(100,100,100,0.5)'),
+        error_x=dict(thickness=1.5, width=4, color='rgba(100,100,100,0.5)'),
+        marker=dict(size=8, line=dict(width=1, color='DarkSlateGrey'))
+    )
+    fig_temp.update_layout(font=dict(family="Times New Roman", size=14), legend=dict(title_font_family="Times New Roman"), margin=dict(l=10, r=10, t=50, b=10))
 
     return fig_flow, fig_temp
+
+def plot_covariance_matrix(report_df: pd.DataFrame) -> Tuple[go.Figure, pd.DataFrame, pd.DataFrame]:
+    # Adicionando T3 (Entrada Fria) e T4 (Saída Fria)
+    cols_interesse = ["flow_real_mean", "T1_mean", "T2_mean", "T3_mean", "T4_mean", "P1_mean", "P2_mean", "permeate_rate_mean"]
+    avail_cols = [c for c in cols_interesse if c in report_df.columns]
+    
+    df_calc = report_df[avail_cols].dropna()
+    
+    # Dicionário com os símbolos de Delta (Δ) matemáticos
+    rename_dict = {
+        "flow_real_mean": "Flow Rate",
+        "T1_mean": "T Inlet Hot Side",
+        "T2_mean": "T outlet Hot Side",
+        "T3_mean": "T Inlet Cold Side",
+        "T4_mean": "T outlet Cold Side",
+        "P1_mean": "ΔP Hot Side",   
+        "P2_mean": "ΔP Cold Side",  
+        "permeate_rate_mean": "Permeate Flux"
+    }
+    df_calc = df_calc.rename(columns=rename_dict)
+    
+    cov_matrix = df_calc.cov()
+    corr_matrix = df_calc.corr()
+    
+    fig = px.imshow(
+        corr_matrix, 
+        text_auto=".2f", 
+        color_continuous_scale="RdBu_r", 
+        zmin=-1, zmax=1,
+        title="Pearson Correlation Matrix of Stabilized Variables",
+        labels=dict(color="Correlation")
+    )
+    fig.update_layout(
+        template="simple_white", 
+        font=dict(family="Times New Roman", size=13),
+        margin=dict(l=10, r=10, t=40, b=10)
+    )
+    
+    return fig, corr_matrix, cov_matrix
 
 def plot_experiment_detail(agilent_detail: pd.DataFrame, balance_detail: pd.DataFrame) -> Tuple[go.Figure, go.Figure, go.Figure]:
     temp_df = agilent_detail.melt(id_vars=["timestamp"], value_vars=[c for c in ["T1", "T2", "T3", "T4"] if c in agilent_detail.columns], var_name="sensor", value_name="value").dropna()
@@ -777,9 +1034,6 @@ with st.sidebar:
     
     st.divider()
     view_mode = st.radio("Navegação", ["Visão Geral", "Detalhe do Experimento"])
-    
-    if view_mode == "Detalhe do Experimento":
-        exp_selecionado = st.selectbox("Selecione o Experimento", options=experiment_registry["experimento"].tolist() if not experiment_registry.empty else [])
 
 # Core de Processamento de Dados
 agilent_df = ensure_replicate_group(workspace.agilent.copy())
@@ -820,135 +1074,288 @@ final_report = build_final_report(uncertainty_summary, sensors_summary, experime
 
 # Visualizações
 if view_mode == "Visão Geral":
-    tab1, tab2, tab3 = st.tabs(["📊 Resultados e Gráficos de Tendência", "🛠️ Diagnóstico de Regime & Outliers", "📁 Tabelas Auxiliares"])
+    # 1. Removida a 4ª Aba (Raw Data)
+    tab1, tab2, tab3 = st.tabs([
+        "📊 Trends & Results", 
+        "🛠️ Steady-State & Outliers", 
+        "🧩 Covariance Matrix"
+    ])
     
     with tab1:
-        st.subheader("Gráficos de Linha: Comportamento do AGMD")
-        st.caption(f"Barras de incerteza exibem a Incerteza Expandida de **{confidence_level*100:.0f}%** baseada em Welch-Satterthwaite.")
+        st.subheader("AGMD Performance Curves")
+        st.caption(f"Error bars represent Expanded Uncertainty (**{confidence_level*100:.0f}%** confidence).")
         
-        fig_flow_2d, fig_temp_2d = plot_2d_faceted_lines(final_report)
+        # 2. CÓDIGO DOS FILTROS DINÂMICOS
+        # Levanta as opções disponíveis que existem no DataFrame
+        available_temps = sorted(final_report["hot_temp_c"].dropna().unique())
+        available_flows = sorted(final_report["flow_ml_min"].dropna().unique())
+        
+        # Cria duas colunas para os botões ficarem lado a lado em cima dos gráficos
+        col_f1, col_f2 = st.columns(2)
+        with col_f1:
+            sel_temps = st.multiselect(
+                "Select Target Temperatures (Left Graph):", 
+                options=available_temps, 
+                default=available_temps # Por padrão, todos começam ativados
+            )
+        with col_f2:
+            sel_flows = st.multiselect(
+                "Select Target Flows (Right Graph):", 
+                options=available_flows, 
+                default=available_flows
+            )
+        
+        # Gera os gráficos passando apenas o que o usuário selecionou nas caixas!
+        fig_flow_2d, fig_temp_2d = plot_2d_faceted_lines(final_report, sel_temps, sel_flows)
         
         col_graf_1, col_graf_2 = st.columns(2)
         with col_graf_1: st.plotly_chart(fig_flow_2d, use_container_width=True)
         with col_graf_2: st.plotly_chart(fig_temp_2d, use_container_width=True)
         
         st.divider()
-        st.subheader("Tabela Consolidada (Taxa de Permeado, Temperaturas e Pressões)")
-        st.dataframe(final_report, use_container_width=True, hide_index=True)
+        st.subheader("Consolidated Table (Permeate Flux, Temperatures, and Pressures)")
+        
+        rename_dict = {
+            "replicate_group": "Group ID", "report_label": "Label", "report_type": "Data Type",
+            "experiments_label": "Valid Experiments", "flow_setting": "Target Flow",
+            "hot_side_inlet_setting": "Target T_in", "flow_real_mean": "Real Flow (mL/min)",
+            "flow_real_u_expanded": "Flow Exp. Unc. (±)", "permeate_rate_mean": "Permeate Flux (g/min)",
+            "reported_uncertainty": "Flux Exp. Unc. (±)", "incerteza_relativa_perc": "Relative Unc. (%)",
+            "n_instances": "Valid Replicates (n)", "u_proxy_type_a": "Std. Unc. Type A",
+            "u_combined_standard": "Comb. Std. Unc. (uc)", "dof_eff": "Effective DOF", "k_factor": "Coverage Factor (k)"
+        }
+        display_df = final_report.drop(columns=["hot_temp_c", "flow_ml_min"]).rename(columns=rename_dict)
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
 
+        st.divider()
+        st.subheader("Energy Metrics Overview (STEC & GOR)")
+        st.caption("Derived from steady-state hot side enthalpy drop, with propagated GUM uncertainty.")
+        
+        energy_report = calculate_energy_metrics(final_report)
+        
+        rename_energy = {
+            "replicate_group": "Group ID",
+            "T1_mean": "T_in Hot (°C)",
+            "T2_mean": "T_out Hot (°C)",
+            "flow_real_mean": "Vol. Flow (mL/min)",
+            "permeate_rate_mean": "Permeate Flux (g/min)",
+            "GOR": "GOR (-)",
+            "GOR_u_expanded": "GOR Unc. (±)",
+            "STEC_kWh_m3": "STEC (kWh/m³)",
+            "STEC_u_expanded": "STEC Unc. (±)",
+            "energy_relative_unc_perc": "Relative Unc. (%)"
+        }
+        
+        display_energy = energy_report[[c for c in rename_energy.keys() if c in energy_report.columns]].copy()
+        display_energy = display_energy.rename(columns=rename_energy)
+        
+        st.dataframe(display_energy.style.format(precision=3), use_container_width=True, hide_index=True)
+        
     with tab2:
-       with tab2:
-        st.subheader("Outliers Detectados (Teste MAD Modificado)")
+        st.subheader("Detected Outliers (Modified MAD Test)")
         if not rejected_instances.empty:
-            st.error(f"Foram rejeitados {len(rejected_instances)} experimento(s) baseados na taxa calculada.")
+            st.error(f"{len(rejected_instances)} experiment(s) were rejected based on flux anomaly.")
             outliers_view = rejected_instances[["experiment_id", "replicate_group", "permeate_rate", "mad_z_score", "mad_threshold"]]
             outliers_view = outliers_view.rename(columns={
-                "permeate_rate": "Taxa Rejeitada (g/min)", 
-                "mad_z_score": "Z-Score Modificado (MAD)", 
-                "mad_threshold": "Limite Crítico"
+                "experiment_id": "Exp ID", "replicate_group": "Group",
+                "permeate_rate": "Rejected Flux (g/min)", 
+                "mad_z_score": "Modified Z-Score (MAD)", 
+                "mad_threshold": "Critical Limit"
             })
             st.dataframe(outliers_view, use_container_width=True, hide_index=True)
         else:
-            st.success("Nenhum experimento foi caracterizado como anomalia (outlier) pelo teste do MAD.")
+            st.success("No experiments were characterized as outliers by the MAD test.")
 
         st.divider()
-        
-        st.subheader("Domínios de Regime Permanente")
-        
-        # Converte para DataFrame
+        st.subheader("Steady-State Domains")
         domain_df = pd.DataFrame([d.__dict__ for d in domains])
-        
-        # Cria uma coluna numérica temporária para forçar a ordenação matemática (1, 2, 3...)
         domain_df["exp_num"] = pd.to_numeric(domain_df["experiment_id"], errors="coerce")
         domain_df = domain_df.sort_values("exp_num").drop(columns=["exp_num"])
-        
-        # Adiciona a coluna de Status
-        domain_df["status"] = np.where(domain_df["points"] > 0, "✔️ Atingido", "❌ Falhou")
-        
-        # Formata as datas para não mostrar o "NaT" feio no Streamlit
+        domain_df["status"] = np.where(domain_df["points"] > 0, "✔️ Achieved", "❌ Failed")
         domain_df["start_time"] = domain_df["start_time"].dt.strftime("%Y-%m-%d %H:%M:%S").fillna("-")
         domain_df["end_time"] = domain_df["end_time"].dt.strftime("%Y-%m-%d %H:%M:%S").fillna("-")
-        
-        # Reorganiza as colunas para ficar visualmente amigável
-        domain_df = domain_df[["experiment_id", "status", "start_time", "end_time", "points"]]
-        
+        domain_df = domain_df[["experiment_id", "status", "start_time", "end_time", "points"]].rename(
+            columns={"experiment_id": "Exp ID", "status": "Status", "start_time": "Start Time", "end_time": "End Time", "points": "Data Points"}
+        )
         st.dataframe(domain_df, use_container_width=True, hide_index=True)
 
         st.divider()
-       
-        st.subheader("Validação de Pressupostos Estatísticos")
-        st.caption("Verificação da normalidade (Shapiro-Wilk) e da homoscedasticidade (Teste de Levene, adequado para dados não-normais).")
-        
-        # Bloco de Métricas do Shapiro-Wilk (Normalidade)
-        st.markdown("##### 1. Teste de Normalidade dos Resíduos (Shapiro-Wilk)")
+        st.subheader("Statistical Assumptions Validation")
+        st.markdown("##### 1. Normality of Residuals (Shapiro-Wilk)")
         col_s1, col_s2, col_s3 = st.columns(3)
-        col_s1.metric("Estatística W", f"{stats_validation['shapiro_stat']:.4f}")
-        col_s2.metric("Valor-p (p-value)", f"{stats_validation['shapiro_p']:.4f}")
-        status_norm = "✅ Normal (p > 0.05)" if stats_validation['is_normal'] else "⚠️ Não-normal (p <= 0.05 - Justifica o uso de Levene)"
-        col_s3.metric("Conclusão Normalidade", status_norm)
+        col_s1.metric("W Statistic", f"{stats_validation['shapiro_stat']:.4f}")
+        col_s2.metric("p-value", f"{stats_validation['shapiro_p']:.4f}")
+        col_s3.metric("Conclusion", "✅ Normal (p > 0.05)" if stats_validation['is_normal'] else "⚠️ Non-normal (p ≤ 0.05)")
         
-        st.divider()
-        
-        # Bloco de Métricas do Levene (Homoscedasticidade)
-        st.markdown("##### 2. Teste de Homoscedasticidade (Teste de Levene)")
+        st.markdown("##### 2. Homoscedasticity (Levene's Test)")
         col_l1, col_l2, col_l3 = st.columns(3)
-        col_l1.metric("Estatística de Levene", f"{stats_validation['levene_stat']:.2f}")
-        col_l2.metric("Valor-p (p-value)", f"{stats_validation['levene_p']:.4f}")
-        status_homo = "✅ Homoscedástico" if stats_validation['is_homoscedastic'] else "⚠️ Heteroscedástico (Estratificação Térmica Necessária)"
-        col_l3.metric("Conclusão Variância", status_homo)
+        col_l1.metric("Levene Statistic", f"{stats_validation['levene_stat']:.2f}")
+        col_l2.metric("p-value", f"{stats_validation['levene_p']:.4f}")
+        col_l3.metric("Conclusion", "✅ Homoscedastic" if stats_validation['is_homoscedastic'] else "⚠️ Heteroscedastic")
+
+        st.divider()
+        st.markdown("##### Permeate Flux Variance by Temperature Range (Physical Evidence)")
         
-        if not stats_validation['is_homoscedastic']:
-            st.info(
-                "💡 **Justificativa Metodológica:** Como os dados não atendem à premissa de normalidade estrita, o Teste de Levene (centrado na mediana) "
-                "foi empregado com sucesso. O resultado (p < 0,05) confirma estatisticamente a heteroscedasticidade e valida a adoção do "
-                "**Agrupamento Estratificado por Temperatura** na propagação de incertezas."
+        # 1. Cria um mapa ligando o nome do grupo à temperatura nominal dele
+        temp_mapping = experiment_registry[["replicate_group", "hot_temp_c"]].drop_duplicates()
+        
+        # 2. Cruza as taxas de permeado validadas com as temperaturas
+        var_data = accepted_instances.merge(temp_mapping, on="replicate_group", how="left")
+        
+        # 3. Calcula a variância (var) agrupando apenas pela temperatura
+        var_df = var_data.groupby("hot_temp_c")["permeate_rate"].var().reset_index()
+        var_df = var_df.dropna()
+        
+        if not var_df.empty:
+            fig_var = px.bar(
+                var_df,
+                x="hot_temp_c",
+                y="permeate_rate",
+                text="permeate_rate",
+                labels={
+                    "hot_temp_c": "Target Temperature (°C)", 
+                    "permeate_rate": "Variance (g/min)²"
+                },
+                template="simple_white"
             )
+            fig_var.update_traces(
+                texttemplate='%{text:.4f}', 
+                textposition='outside', 
+                marker_color='#d62728' # Vermelho padrão metrológico
+            )
+            fig_var.update_layout(
+                font=dict(family="Times New Roman", size=14),
+                margin=dict(l=10, r=10, t=10, b=10),
+                xaxis=dict(type='category') # Força o X a tratar as temperaturas como categorias (barras separadas)
+            )
+            st.plotly_chart(fig_var, use_container_width=True)
+        else:
+            st.warning("Não foi possível calcular a variância. Verifique os dados de entrada.")
+
+    with tab3: 
+        st.subheader("Correlation & Covariance Analysis")
+        st.caption("Investigates the linear interdependence and physical coupling between inputs and permeate flux.")
         
-        # Exibe o Gráfico de Barras da Variância por Temperatura
+        fig_corr, corr_df, cov_df = plot_covariance_matrix(final_report)
+        st.plotly_chart(fig_corr, use_container_width=True)
+        
         st.divider()
-        fig_var = plot_variance_by_temperature(accepted_instances, "replicate_group", "permeate_rate")
-        st.plotly_chart(fig_var, use_container_width=True)
-        
-        st.divider()
-        st.subheader("Propagação das Incertezas (GUM - Estratificada)")
-        st.dataframe(uncertainty_summary, use_container_width=True, hide_index=True)
-        
-    with tab3:
-        st.subheader("Tabelas Estruturais")
-        with st.expander("Mapeamento de Sensores"): st.dataframe(pd.DataFrame([{"Sensor": k, "Incerteza padrão": v} for k, v in workspace.sensor_uncertainties.items()]), use_container_width=True, hide_index=True)
-        with st.expander("Mapeamento de Grupos"): st.dataframe(replicate_groups_table, use_container_width=True, hide_index=True)
-        with st.expander("Dados Brutos Agilent (Top 500)"): st.dataframe(workspace.agilent.head(500), use_container_width=True)
-        with st.expander("Dados Brutos Balança (Top 500)"): st.dataframe(workspace.balance.head(500), use_container_width=True)
+        st.markdown("##### Experimental Covariance Matrix")
+        st.dataframe(cov_df.style.format("{:.4f}"), use_container_width=True)
 
 elif view_mode == "Detalhe do Experimento":
-    if not 'exp_selecionado' in locals(): st.stop()
-    selected_group = experiment_registry[experiment_registry["experimento"] == exp_selecionado]
-    if selected_group.empty: st.stop()
-    group_row = selected_group.iloc[0]
-
-    st.subheader(f"Detalhamento Profundo: Experimento {exp_selecionado}")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Grupo", group_row['group_display_name'])
-    c2.metric("Vazão Fixada", group_row['flow_setting'])
-    c3.metric("Temp. Quente", group_row['hot_side_inlet_setting'])
-
-    detail_agilent = agilent_domain_df[agilent_domain_df["experiment_id"] == exp_selecionado]
-    detail_balance = balance_domain_df[balance_domain_df["experiment_id"] == exp_selecionado]
-    
-    if detail_agilent.empty or detail_balance.empty:
-        st.warning("Este experimento não possui dados suficientes no domínio de regime.")
-    else:
-        st.caption(f"**Janela:** `{detail_agilent['timestamp'].min()}` até `{detail_agilent['timestamp'].max()}`")
+        st.subheader("Single Experiment Analysis")
+        st.caption("Detailed view of steady-state behavior and stability.")
         
-        metrics = []
-        for s in ["T1", "T2", "T3", "T4", "P1", "P2"]:
-            if s in detail_agilent: metrics.append({"Métrica": s, "Valor Estável (Média)": detail_agilent[s].mean()})
-        if not detail_balance.empty:
-            tr = fit_time_trend(detail_balance, "timestamp", "Leitura")
-            metrics.append({"Métrica": "Taxa de Permeado (Regressão Linear)", "Valor Estável (Média)": f"{tr['slope_per_min']:.4f} g/min"})
-        st.dataframe(pd.DataFrame(metrics), use_container_width=True, hide_index=True)
+        # 1. Puxa os IDs de forma segura
+        if "experimento" in experiment_registry.columns:
+            raw_ids = experiment_registry["experimento"].dropna().unique()
+        else:
+            raw_ids = experiment_registry["experiment_id"].dropna().unique()
+            
+        # 2. Força a conversão para Inteiro para manter a ordem (1, 2, 3...)
+        exp_list = sorted([int(x) for x in raw_ids if str(x).strip().isdigit()])
+        selected_exp = st.selectbox("Select Experiment ID:", exp_list)
+        
+        if selected_exp:
+            sel_exp_str = str(selected_exp)
+            num_exp = int(selected_exp)
+            st.markdown(f"### Steady-State Data for Exp: **{selected_exp}**")
+            
+            # --- 1. Tabela de Resumo do Experimento ---
+            st.markdown("##### Steady-State Aggregated Results")
+            import re
+            mask = final_report["experiments_label"].astype(str).apply(lambda x: bool(re.search(rf'\b{sel_exp_str}\b', x)))
+            exp_summary = final_report[mask]
+            
+            if not exp_summary.empty:
+                rename_dict_detail = {
+                    "replicate_group": "Group ID",
+                    "flow_real_mean": "Real Flow (mL/min)",
+                    "flow_real_u_expanded": "Flow Unc. (±)",
+                    "permeate_rate_mean": "Permeate Flux (g/min)",
+                    "reported_uncertainty": "Flux Unc. (±)",
+                    "T1_mean": "T1_in Hot (°C)",
+                    "T1_u_expanded": "T1 Unc. (±)",
+                    "T2_mean": "T2_out Hot (°C)",
+                    "T3_mean": "T3_in Cold (°C)",
+                    "T4_mean": "T4_out Cold (°C)",
+                    "P1_mean": "ΔP Hot Side",
+                    "P2_mean": "ΔP Cold Side"
+                }
+                
+                cols_to_show = [c for c in rename_dict_detail.keys() if c in exp_summary.columns]
+                disp_summary = exp_summary[cols_to_show].rename(columns=rename_dict_detail)
+                st.dataframe(disp_summary.style.format(precision=4), use_container_width=True, hide_index=True)
+            
+            st.divider()
+            
+            # --- 2. Filtro Exclusivo do Domínio de Regime Permanente ---
+            # Identifica as colunas de ID nos dataframes de domínio filtrado
+            ag_col = "experiment_id" if "experiment_id" in agilent_domain_df.columns else "experimento"
+            bal_col = "experiment_id" if "experiment_id" in balance_domain_df.columns else "experimento"
+            
+            # Puxa apenas os dados estabilizados (matematicamente convertidos para evitar erros)
+            detail_agilent = agilent_domain_df[pd.to_numeric(agilent_domain_df[ag_col], errors='coerce') == num_exp]
+            detail_balance = balance_domain_df[pd.to_numeric(balance_domain_df[bal_col], errors='coerce') == num_exp]
+            
+            if detail_agilent.empty or detail_balance.empty:
+                st.warning("No steady-state domain data available for this experiment. It may have failed the stabilization criteria.")
+            else:
+                start_time = detail_agilent['timestamp'].min()
+                end_time = detail_agilent['timestamp'].max()
+                st.caption(f"**Stabilized Window:** `{start_time}` to `{end_time}`")
+                
+                # --- 3. Gráficos de Série Temporal Filtrada (Padrão Artigo) ---
+                
+                # GRÁFICO 1: TEMPERATURAS
+                temp_cols = [c for c in ["T1", "T2", "T3", "T4"] if c in detail_agilent.columns]
+                if temp_cols:
+                    fig_t = px.line(
+                        detail_agilent, 
+                        x="timestamp", 
+                        y=temp_cols,
+                        title="Thermal Steady-State Profiles",
+                        labels={"timestamp": "Time (Local)", "value": "Temperature (°C)", "variable": "Thermocouple"},
+                        template="simple_white",
+                        color_discrete_sequence=px.colors.qualitative.Set1
+                    )
+                    fig_t.update_layout(
+                        font=dict(family="Times New Roman", size=14), 
+                        legend=dict(title=None, orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                    )
+                    st.plotly_chart(fig_t, use_container_width=True)
 
-        fig_temp, fig_press, fig_perm = plot_experiment_detail(detail_agilent, detail_balance)
-        st.plotly_chart(fig_temp, use_container_width=True)
-        st.plotly_chart(fig_press, use_container_width=True)
-        st.plotly_chart(fig_perm, use_container_width=True)
+                # GRÁFICO 2: PRESSÕES
+                press_cols = [c for c in ["P1", "P2"] if c in detail_agilent.columns]
+                if press_cols:
+                    fig_p = px.line(
+                        detail_agilent, 
+                        x="timestamp", 
+                        y=press_cols,
+                        title="Hydrodynamic Steady-State Profiles",
+                        labels={"timestamp": "Time (Local)", "value": "Pressure (Pa)", "variable": "Transducer"},
+                        template="simple_white",
+                        color_discrete_sequence=px.colors.qualitative.Dark2
+                    )
+                    fig_p.update_layout(
+                        font=dict(family="Times New Roman", size=14), 
+                        legend=dict(title=None, orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                    )
+                    st.plotly_chart(fig_p, use_container_width=True)
+
+                # GRÁFICO 3: MASSA DA BALANÇA
+                mass_col = "Leitura" if "Leitura" in detail_balance.columns else "mass" if "mass" in detail_balance.columns else detail_balance.columns[-1]
+                
+                fig_m = px.scatter(
+                    detail_balance, 
+                    x="timestamp", 
+                    y=mass_col,
+                    title="Permeate Mass Accumulation (Regression Zone)",
+                    labels={"timestamp": "Time (Local)", mass_col: "Accumulated Mass (g)"},
+                    template="simple_white",
+                    color_discrete_sequence=["#d62728"]
+                )
+                fig_m.update_traces(marker=dict(size=6, opacity=0.8))
+                fig_m.update_layout(font=dict(family="Times New Roman", size=14))
+                st.plotly_chart(fig_m, use_container_width=True)
